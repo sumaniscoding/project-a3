@@ -100,19 +100,50 @@ func handleClient(conn net.Conn) {
 	// Send welcome
 	fmt.Fprintf(conn, "WELCOME %d\n", clientID)
 
-	// Read messages line by line
 	reader := bufio.NewReader(conn)
 
+	// Simple rate limit
+	messageCount := 0
+	lastReset := time.Now()
+
 	for {
-		message, err := reader.ReadString('\n')
+		line, err := reader.ReadString('\n')
 		if err != nil {
 			break
 		}
 
-		message = strings.TrimSpace(message)
-		log.Printf("Client #%d says: %s\n", clientID, message)
+		// Rate limiting: max 10 messages per 5 seconds
+		if time.Since(lastReset) > 5*time.Second {
+			messageCount = 0
+			lastReset = time.Now()
+		}
 
-		switch message {
+		messageCount++
+		if messageCount > 10 {
+			fmt.Fprintf(conn, "ERROR RATE_LIMIT\n")
+			log.Printf("Client #%d rate limited\n", clientID)
+			break
+		}
+
+		line = strings.TrimSpace(line)
+		parts := strings.Split(line, "|")
+
+		if len(parts) != 2 {
+			fmt.Fprintf(conn, "ERROR BAD_FORMAT\n")
+			continue
+		}
+
+		version := parts[0]
+		command := parts[1]
+
+		if version != "1" {
+			fmt.Fprintf(conn, "ERROR BAD_VERSION\n")
+			continue
+		}
+
+		log.Printf("Client #%d cmd: %s\n", clientID, command)
+
+		switch command {
 		case "HELLO":
 			fmt.Fprintf(conn, "HELLO RECEIVED\n")
 
@@ -120,7 +151,7 @@ func handleClient(conn net.Conn) {
 			fmt.Fprintf(conn, "PONG\n")
 
 		default:
-			fmt.Fprintf(conn, "UNKNOWN COMMAND\n")
+			fmt.Fprintf(conn, "ERROR UNKNOWN_COMMAND\n")
 		}
 	}
 
