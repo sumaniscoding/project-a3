@@ -30,7 +30,7 @@ func loadConfig() Config {
 	data, err := os.ReadFile("config.json")
 	if err != nil {
 		log.Fatalf("Failed to read config.json: %v", err)
-  	}
+	}
 
 	var cfg Config
 	if err := json.Unmarshal(data, &cfg); err != nil {
@@ -45,13 +45,14 @@ func loadConfig() Config {
 // Client State
 // --------------------
 //
+
 type Client struct {
 	ID        int
 	Conn      net.Conn
-	Username  string
 	SessionID string
 	LoggedIn  bool
 }
+
 //
 // --------------------
 // Server State
@@ -63,6 +64,18 @@ var (
 	clients      = make(map[int]*Client)
 	clientsMutex sync.Mutex
 )
+
+//
+// --------------------
+// Session Validation
+// --------------------
+//
+
+// In real life, ZoneServer would ask LoginServer or DB.
+// For now we trust token format.
+func validateSessionToken(token string) bool {
+	return strings.HasPrefix(token, "TOKEN-")
+}
 
 //
 // --------------------
@@ -78,17 +91,14 @@ func startTCPServer(port int) net.Listener {
 		log.Fatalf("Failed to listen on %s: %v", address, err)
 	}
 
-	log.Printf("TCP server listening on %s\n", address)
+	log.Printf("ZoneServer listening on %s\n", address)
 	return listener
-}
-
-func generateSessionToken(clientID int) string {
-	return fmt.Sprintf("SID-%d-%d", clientID, time.Now().UnixNano())
 }
 
 func handleClient(conn net.Conn) {
 	defer conn.Close()
 
+	// Register client
 	clientsMutex.Lock()
 	clientID := nextClientID
 	nextClientID++
@@ -101,11 +111,11 @@ func handleClient(conn net.Conn) {
 	clientsMutex.Unlock()
 
 	log.Printf("Client #%d connected from %s\n", clientID, conn.RemoteAddr())
-
 	fmt.Fprintf(conn, "WELCOME %d\n", clientID)
 
 	reader := bufio.NewReader(conn)
 
+	// Rate limiting
 	messageCount := 0
 	lastReset := time.Now()
 
@@ -115,7 +125,7 @@ func handleClient(conn net.Conn) {
 			break
 		}
 
-		// Rate limiting
+		// Reset rate limit window
 		if time.Since(lastReset) > 5*time.Second {
 			messageCount = 0
 			lastReset = time.Now()
@@ -124,6 +134,7 @@ func handleClient(conn net.Conn) {
 		messageCount++
 		if messageCount > 10 {
 			fmt.Fprintf(conn, "ERROR RATE_LIMIT\n")
+			log.Printf("Client #%d rate limited\n", clientID)
 			break
 		}
 
@@ -143,36 +154,40 @@ func handleClient(conn net.Conn) {
 			continue
 		}
 
-		// LOGIN command (special)
-		if strings.HasPrefix(payload, "LOGIN ") {
+		// --------------------
+		// SESSION AUTH
+		// --------------------
+		if strings.HasPrefix(payload, "SESSION ") {
 			if client.LoggedIn {
-				fmt.Fprintf(conn, "ERROR ALREADY_LOGGED_IN\n")
+				fmt.Fprintf(conn, "ERROR ALREADY_AUTHENTICATED\n")
 				continue
 			}
 
-			username := strings.TrimSpace(strings.TrimPrefix(payload, "LOGIN "))
-			if username == "" {
-				fmt.Fprintf(conn, "ERROR BAD_LOGIN\n")
+			token := strings.TrimSpace(strings.TrimPrefix(payload, "SESSION "))
+			if !validateSessionToken(token) {
+				fmt.Fprintf(conn, "ERROR INVALID_SESSION\n")
 				continue
 			}
 
-			client.Username = username
-			client.SessionID = generateSessionToken(client.ID)
+			client.SessionID = token
 			client.LoggedIn = true
 
-			fmt.Fprintf(conn, "LOGIN_OK %s\n", client.SessionID)
-			log.Printf("Client #%d logged in as %s\n", client.ID, client.Username)
+			fmt.Fprintf(conn, "SESSION_OK\n")
+			log.Printf("Client #%d authenticated with session\n", clientID)
 			continue
 		}
 
-		// Reject all other commands if not logged in
+		// Reject everything until authenticated
 		if !client.LoggedIn {
-			fmt.Fprintf(conn, "ERROR NOT_LOGGED_IN\n")
+			fmt.Fprintf(conn, "ERROR NOT_AUTHENTICATED\n")
 			continue
 		}
 
-		log.Printf("Client #%d cmd: %s\n", client.ID, payload)
+		log.Printf("Client #%d cmd: %s\n", clientID, payload)
 
+		// --------------------
+		// COMMANDS
+		// --------------------
 		switch payload {
 		case "PING":
 			fmt.Fprintf(conn, "PONG\n")
@@ -182,6 +197,7 @@ func handleClient(conn net.Conn) {
 		}
 	}
 
+	// Cleanup
 	clientsMutex.Lock()
 	delete(clients, clientID)
 	clientsMutex.Unlock()
@@ -205,11 +221,10 @@ func main() {
 	log.Println("Status: STARTED")
 	log.Println("=================================")
 
-	// Handle shutdown signals
+	// Handle shutdown
 	shutdown := make(chan os.Signal, 1)
 	signal.Notify(shutdown, syscall.SIGINT, syscall.SIGTERM)
 
-	// Start TCP server
 	listener := startTCPServer(cfg.ListenPort)
 	defer listener.Close()
 
@@ -218,14 +233,14 @@ func main() {
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
-				// This happens during normal shutdown
+				// Happens on shutdown
 				return
 			}
 			go handleClient(conn)
 		}
 	}()
 
-	// Server tick loop
+	// Tick loop
 	ticker := time.NewTicker(time.Duration(cfg.TickRateMs) * time.Millisecond)
 	defer ticker.Stop()
 
@@ -233,14 +248,14 @@ func main() {
 		select {
 		case <-ticker.C:
 			clientsMutex.Lock()
-			clientCount := len(clients)
+			count := len(clients)
 			clientsMutex.Unlock()
 
-			log.Printf("Server tick | Connected clients: %d\n", clientCount)
+			log.Printf("Server tick | Connected clients: %d\n", count)
 
 		case <-shutdown:
 			log.Println("Shutdown signal received")
-			log.Println("Server shutting down cleanly...")
+			log.Println("ZoneServer shutting down cleanly...")
 			return
 		}
 	}
