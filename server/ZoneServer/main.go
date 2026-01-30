@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -95,12 +97,30 @@ func handleClient(conn net.Conn) {
 
 	log.Printf("Client #%d connected from %s\n", clientID, conn.RemoteAddr())
 
-	// Block until client disconnects
-	buffer := make([]byte, 1)
+	// Send welcome
+	fmt.Fprintf(conn, "WELCOME %d\n", clientID)
+
+	// Read messages line by line
+	reader := bufio.NewReader(conn)
+
 	for {
-		_, err := conn.Read(buffer)
+		message, err := reader.ReadString('\n')
 		if err != nil {
 			break
+		}
+
+		message = strings.TrimSpace(message)
+		log.Printf("Client #%d says: %s\n", clientID, message)
+
+		switch message {
+		case "HELLO":
+			fmt.Fprintf(conn, "HELLO RECEIVED\n")
+
+		case "PING":
+			fmt.Fprintf(conn, "PONG\n")
+
+		default:
+			fmt.Fprintf(conn, "UNKNOWN COMMAND\n")
 		}
 	}
 
