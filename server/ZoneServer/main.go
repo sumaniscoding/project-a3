@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -12,6 +13,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	_ "github.com/lib/pq"
 )
 
 //
@@ -63,18 +66,23 @@ var (
 	nextClientID = 1
 	clients      = make(map[int]*Client)
 	clientsMutex sync.Mutex
+	db           *sql.DB
 )
 
 //
 // --------------------
-// Session Validation
+// Session Validation (DB)
 // --------------------
 //
 
-// In real life, ZoneServer would ask LoginServer or DB.
-// For now we trust token format.
 func validateSessionToken(token string) bool {
-	return strings.HasPrefix(token, "TOKEN-")
+	var username string
+	err := db.QueryRow(
+		"SELECT username FROM sessions WHERE token=$1",
+		token,
+	).Scan(&username)
+
+	return err == nil
 }
 
 //
@@ -221,6 +229,22 @@ func main() {
 	log.Println("Status: STARTED")
 	log.Println("=================================")
 
+	// Connect to DB
+	var err error
+	db, err = sql.Open(
+		"postgres",
+		"dbname=projecta3 sslmode=disable",
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if err = db.Ping(); err != nil {
+		log.Fatal("ZoneServer DB connection failed:", err)
+	}
+
+	log.Println("ZoneServer connected to DB")
+
 	// Handle shutdown
 	shutdown := make(chan os.Signal, 1)
 	signal.Notify(shutdown, syscall.SIGINT, syscall.SIGTERM)
@@ -233,7 +257,7 @@ func main() {
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
-				// Happens on shutdown
+				// Happens during shutdown
 				return
 			}
 			go handleClient(conn)
