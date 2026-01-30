@@ -30,7 +30,7 @@ func loadConfig() Config {
 	data, err := os.ReadFile("config.json")
 	if err != nil {
 		log.Fatalf("Failed to read config.json: %v", err)
-	}
+  	}
 
 	var cfg Config
 	if err := json.Unmarshal(data, &cfg); err != nil {
@@ -45,12 +45,13 @@ func loadConfig() Config {
 // Client State
 // --------------------
 //
-
 type Client struct {
-	ID   int
-	Conn net.Conn
+	ID        int
+	Conn      net.Conn
+	Username  string
+	SessionID string
+	LoggedIn  bool
 }
-
 //
 // --------------------
 // Server State
@@ -81,6 +82,10 @@ func startTCPServer(port int) net.Listener {
 	return listener
 }
 
+func generateSessionToken(clientID int) string {
+	return fmt.Sprintf("SID-%d-%d", clientID, time.Now().UnixNano())
+}
+
 func handleClient(conn net.Conn) {
 	defer conn.Close()
 
@@ -97,12 +102,10 @@ func handleClient(conn net.Conn) {
 
 	log.Printf("Client #%d connected from %s\n", clientID, conn.RemoteAddr())
 
-	// Send welcome
 	fmt.Fprintf(conn, "WELCOME %d\n", clientID)
 
 	reader := bufio.NewReader(conn)
 
-	// Simple rate limit
 	messageCount := 0
 	lastReset := time.Now()
 
@@ -112,7 +115,7 @@ func handleClient(conn net.Conn) {
 			break
 		}
 
-		// Rate limiting: max 10 messages per 5 seconds
+		// Rate limiting
 		if time.Since(lastReset) > 5*time.Second {
 			messageCount = 0
 			lastReset = time.Now()
@@ -121,12 +124,11 @@ func handleClient(conn net.Conn) {
 		messageCount++
 		if messageCount > 10 {
 			fmt.Fprintf(conn, "ERROR RATE_LIMIT\n")
-			log.Printf("Client #%d rate limited\n", clientID)
 			break
 		}
 
 		line = strings.TrimSpace(line)
-		parts := strings.Split(line, "|")
+		parts := strings.SplitN(line, "|", 2)
 
 		if len(parts) != 2 {
 			fmt.Fprintf(conn, "ERROR BAD_FORMAT\n")
@@ -134,19 +136,44 @@ func handleClient(conn net.Conn) {
 		}
 
 		version := parts[0]
-		command := parts[1]
+		payload := parts[1]
 
 		if version != "1" {
 			fmt.Fprintf(conn, "ERROR BAD_VERSION\n")
 			continue
 		}
 
-		log.Printf("Client #%d cmd: %s\n", clientID, command)
+		// LOGIN command (special)
+		if strings.HasPrefix(payload, "LOGIN ") {
+			if client.LoggedIn {
+				fmt.Fprintf(conn, "ERROR ALREADY_LOGGED_IN\n")
+				continue
+			}
 
-		switch command {
-		case "HELLO":
-			fmt.Fprintf(conn, "HELLO RECEIVED\n")
+			username := strings.TrimSpace(strings.TrimPrefix(payload, "LOGIN "))
+			if username == "" {
+				fmt.Fprintf(conn, "ERROR BAD_LOGIN\n")
+				continue
+			}
 
+			client.Username = username
+			client.SessionID = generateSessionToken(client.ID)
+			client.LoggedIn = true
+
+			fmt.Fprintf(conn, "LOGIN_OK %s\n", client.SessionID)
+			log.Printf("Client #%d logged in as %s\n", client.ID, client.Username)
+			continue
+		}
+
+		// Reject all other commands if not logged in
+		if !client.LoggedIn {
+			fmt.Fprintf(conn, "ERROR NOT_LOGGED_IN\n")
+			continue
+		}
+
+		log.Printf("Client #%d cmd: %s\n", client.ID, payload)
+
+		switch payload {
 		case "PING":
 			fmt.Fprintf(conn, "PONG\n")
 
