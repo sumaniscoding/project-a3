@@ -1,0 +1,19 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Builds
+bin/
+obj/
+
+# Logs
+*.log
+
+# Unity (future)
+Library/
+Temp/
+Build/
+Builds/
+
+# Secrets
+.env
