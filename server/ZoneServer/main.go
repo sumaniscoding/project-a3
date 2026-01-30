@@ -50,10 +50,13 @@ func loadConfig() Config {
 //
 
 type Client struct {
-	ID        int
-	Conn      net.Conn
-	SessionID string
-	LoggedIn  bool
+	ID          int
+	Conn        net.Conn
+	SessionID   string
+	LoggedIn    bool
+	Username    string
+	CharacterID int
+	Character   string
 }
 
 //
@@ -75,14 +78,17 @@ var (
 // --------------------
 //
 
-func validateSessionToken(token string) bool {
+func validateSessionToken(token string) (bool, string) {
 	var username string
 	err := db.QueryRow(
 		"SELECT username FROM sessions WHERE token=$1",
 		token,
 	).Scan(&username)
 
-	return err == nil
+	if err != nil {
+		return false, ""
+	}
+	return true, username
 }
 
 //
@@ -172,16 +178,18 @@ func handleClient(conn net.Conn) {
 			}
 
 			token := strings.TrimSpace(strings.TrimPrefix(payload, "SESSION "))
-			if !validateSessionToken(token) {
+			ok, username := validateSessionToken(token)
+			if !ok {
 				fmt.Fprintf(conn, "ERROR INVALID_SESSION\n")
 				continue
 			}
 
 			client.SessionID = token
+			client.Username = username
 			client.LoggedIn = true
 
 			fmt.Fprintf(conn, "SESSION_OK\n")
-			log.Printf("Client #%d authenticated with session\n", clientID)
+			log.Printf("Client #%d authenticated as %s\n", clientID, username)
 			continue
 		}
 
@@ -196,9 +204,69 @@ func handleClient(conn net.Conn) {
 		// --------------------
 		// COMMANDS
 		// --------------------
-		switch payload {
-		case "PING":
+		switch {
+		case payload == "PING":
 			fmt.Fprintf(conn, "PONG\n")
+
+		case payload == "CHAR_LIST":
+			rows, err := db.Query(
+				"SELECT name, class, level FROM characters WHERE username=$1",
+				client.Username,
+			)
+			if err != nil {
+				fmt.Fprintf(conn, "ERROR DB_FAILURE\n")
+				break
+			}
+			defer rows.Close()
+
+			for rows.Next() {
+				var name, class string
+				var level int
+				rows.Scan(&name, &class, &level)
+				fmt.Fprintf(conn, "CHAR %s %s %d\n", name, class, level)
+			}
+			fmt.Fprintf(conn, "CHAR_LIST_END\n")
+
+		case strings.HasPrefix(payload, "CHAR_CREATE "):
+			parts := strings.Split(payload, " ")
+			if len(parts) != 3 {
+				fmt.Fprintf(conn, "ERROR BAD_FORMAT\n")
+				break
+			}
+
+			name := parts[1]
+			class := parts[2]
+
+			_, err := db.Exec(
+				"INSERT INTO characters (username, name, class) VALUES ($1, $2, $3)",
+				client.Username, name, class,
+			)
+			if err != nil {
+				fmt.Fprintf(conn, "ERROR CHAR_CREATE_FAILED\n")
+				break
+			}
+
+			fmt.Fprintf(conn, "CHAR_CREATED %s\n", name)
+
+		case strings.HasPrefix(payload, "CHAR_SELECT "):
+			name := strings.TrimSpace(strings.TrimPrefix(payload, "CHAR_SELECT "))
+
+			var id int
+			err := db.QueryRow(
+				"SELECT id FROM characters WHERE username=$1 AND name=$2",
+				client.Username, name,
+			).Scan(&id)
+
+			if err != nil {
+				fmt.Fprintf(conn, "ERROR CHAR_NOT_FOUND\n")
+				break
+			}
+
+			client.CharacterID = id
+			client.Character = name
+
+			fmt.Fprintf(conn, "CHAR_SELECTED %s\n", name)
+			log.Printf("Client #%d selected character %s\n", clientID, name)
 
 		default:
 			fmt.Fprintf(conn, "ERROR UNKNOWN_COMMAND\n")
@@ -257,7 +325,6 @@ func main() {
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
-				// Happens during shutdown
 				return
 			}
 			go handleClient(conn)
@@ -274,7 +341,6 @@ func main() {
 			clientsMutex.Lock()
 			count := len(clients)
 			clientsMutex.Unlock()
-
 			log.Printf("Server tick | Connected clients: %d\n", count)
 
 		case <-shutdown:
@@ -284,4 +350,3 @@ func main() {
 		}
 	}
 }
-
