@@ -7,13 +7,16 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 )
 
+//
 // --------------------
 // Config
 // --------------------
+//
 
 type Config struct {
 	ServerName string `json:"server_name"`
@@ -35,9 +38,34 @@ func loadConfig() Config {
 	return cfg
 }
 
+//
+// --------------------
+// Client State
+// --------------------
+//
+
+type Client struct {
+	ID   int
+	Conn net.Conn
+}
+
+//
+// --------------------
+// Server State
+// --------------------
+//
+
+var (
+	nextClientID = 1
+	clients      = make(map[int]*Client)
+	clientsMutex sync.Mutex
+)
+
+//
 // --------------------
 // TCP Server
 // --------------------
+//
 
 func startTCPServer(port int) net.Listener {
 	address := fmt.Sprintf(":%d", port)
@@ -51,9 +79,43 @@ func startTCPServer(port int) net.Listener {
 	return listener
 }
 
+func handleClient(conn net.Conn) {
+	defer conn.Close()
+
+	clientsMutex.Lock()
+	clientID := nextClientID
+	nextClientID++
+
+	client := &Client{
+		ID:   clientID,
+		Conn: conn,
+	}
+	clients[clientID] = client
+	clientsMutex.Unlock()
+
+	log.Printf("Client #%d connected from %s\n", clientID, conn.RemoteAddr())
+
+	// Block until client disconnects
+	buffer := make([]byte, 1)
+	for {
+		_, err := conn.Read(buffer)
+		if err != nil {
+			break
+		}
+	}
+
+	clientsMutex.Lock()
+	delete(clients, clientID)
+	clientsMutex.Unlock()
+
+	log.Printf("Client #%d disconnected\n", clientID)
+}
+
+//
 // --------------------
 // Main
 // --------------------
+//
 
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime)
@@ -73,17 +135,15 @@ func main() {
 	listener := startTCPServer(cfg.ListenPort)
 	defer listener.Close()
 
-	// Accept clients in a separate goroutine
+	// Accept connections
 	go func() {
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
-				log.Println("Accept error:", err)
+				// This happens during normal shutdown
 				return
 			}
-
-			log.Println("Client connected:", conn.RemoteAddr())
-			conn.Close()
+			go handleClient(conn)
 		}
 	}()
 
@@ -94,7 +154,11 @@ func main() {
 	for {
 		select {
 		case <-ticker.C:
-			log.Println("Server tick")
+			clientsMutex.Lock()
+			clientCount := len(clients)
+			clientsMutex.Unlock()
+
+			log.Printf("Server tick | Connected clients: %d\n", clientCount)
 
 		case <-shutdown:
 			log.Println("Shutdown signal received")
