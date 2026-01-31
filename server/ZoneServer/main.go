@@ -2,351 +2,286 @@ package main
 
 import (
 	"bufio"
-	"database/sql"
+	"context"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/signal"
-	"strings"
-	"sync"
 	"syscall"
 	"time"
-
-	_ "github.com/lib/pq"
 )
 
-//
-// --------------------
-// Config
-// --------------------
-//
+var worlds map[WorldID]*World
 
-type Config struct {
-	ServerName string `json:"server_name"`
-	TickRateMs int    `json:"tick_rate_ms"`
-	ListenPort int    `json:"listen_port"`
+// --------------------
+// WORLD ENTRY CHECK
+// --------------------
+func canEnterWorld(c *Character, w *World) (bool, string) {
+	if w == nil {
+		return false, "WORLD_NOT_FOUND"
+	}
+	if !w.Unlocked {
+		return false, "WORLD_LOCKED"
+	}
+	if c.Level < w.MinLevel || c.Level > w.MaxLevel {
+		return false, "LEVEL_NOT_IN_RANGE"
+	}
+	if w.RequiresAura && c.AuraLevel == 0 {
+		return false, "AURA_REQUIRED"
+	}
+	return true, "OK"
 }
 
-func loadConfig() Config {
-	data, err := os.ReadFile("config.json")
+// --------------------
+// NETWORK SEND HELPER
+// --------------------
+func sendMessage(conn net.Conn, msg ServerMessage) {
+	data, err := json.Marshal(msg)
 	if err != nil {
-		log.Fatalf("Failed to read config.json: %v", err)
+		log.Printf("Failed to marshal message: %v", err)
+		return
 	}
-
-	var cfg Config
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		log.Fatalf("Failed to parse config.json: %v", err)
-	}
-
-	return cfg
-}
-
-//
-// --------------------
-// Client State
-// --------------------
-//
-
-type Client struct {
-	ID          int
-	Conn        net.Conn
-	SessionID   string
-	LoggedIn    bool
-	Username    string
-	CharacterID int
-	Character   string
-}
-
-//
-// --------------------
-// Server State
-// --------------------
-//
-
-var (
-	nextClientID = 1
-	clients      = make(map[int]*Client)
-	clientsMutex sync.Mutex
-	db           *sql.DB
-)
-
-//
-// --------------------
-// Session Validation (DB)
-// --------------------
-//
-
-func validateSessionToken(token string) (bool, string) {
-	var username string
-	err := db.QueryRow(
-		"SELECT username FROM sessions WHERE token=$1",
-		token,
-	).Scan(&username)
-
+	data = append(data, '\n')
+	_, err = conn.Write(data)
 	if err != nil {
-		return false, ""
+		log.Printf("Failed to write message: %v", err)
 	}
-	return true, username
 }
 
-//
 // --------------------
-// TCP Server
+// MAIN
 // --------------------
-//
-
-func startTCPServer(port int) net.Listener {
-	address := fmt.Sprintf(":%d", port)
-
-	listener, err := net.Listen("tcp", address)
-	if err != nil {
-		log.Fatalf("Failed to listen on %s: %v", address, err)
-	}
-
-	log.Printf("ZoneServer listening on %s\n", address)
-	return listener
-}
-
-func handleClient(conn net.Conn) {
-	defer conn.Close()
-
-	// Register client
-	clientsMutex.Lock()
-	clientID := nextClientID
-	nextClientID++
-
-	client := &Client{
-		ID:   clientID,
-		Conn: conn,
-	}
-	clients[clientID] = client
-	clientsMutex.Unlock()
-
-	log.Printf("Client #%d connected from %s\n", clientID, conn.RemoteAddr())
-	fmt.Fprintf(conn, "WELCOME %d\n", clientID)
-
-	reader := bufio.NewReader(conn)
-
-	// Rate limiting
-	messageCount := 0
-	lastReset := time.Now()
-
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			break
-		}
-
-		// Reset rate limit window
-		if time.Since(lastReset) > 5*time.Second {
-			messageCount = 0
-			lastReset = time.Now()
-		}
-
-		messageCount++
-		if messageCount > 10 {
-			fmt.Fprintf(conn, "ERROR RATE_LIMIT\n")
-			log.Printf("Client #%d rate limited\n", clientID)
-			break
-		}
-
-		line = strings.TrimSpace(line)
-		parts := strings.SplitN(line, "|", 2)
-
-		if len(parts) != 2 {
-			fmt.Fprintf(conn, "ERROR BAD_FORMAT\n")
-			continue
-		}
-
-		version := parts[0]
-		payload := parts[1]
-
-		if version != "1" {
-			fmt.Fprintf(conn, "ERROR BAD_VERSION\n")
-			continue
-		}
-
-		// --------------------
-		// SESSION AUTH
-		// --------------------
-		if strings.HasPrefix(payload, "SESSION ") {
-			if client.LoggedIn {
-				fmt.Fprintf(conn, "ERROR ALREADY_AUTHENTICATED\n")
-				continue
-			}
-
-			token := strings.TrimSpace(strings.TrimPrefix(payload, "SESSION "))
-			ok, username := validateSessionToken(token)
-			if !ok {
-				fmt.Fprintf(conn, "ERROR INVALID_SESSION\n")
-				continue
-			}
-
-			client.SessionID = token
-			client.Username = username
-			client.LoggedIn = true
-
-			fmt.Fprintf(conn, "SESSION_OK\n")
-			log.Printf("Client #%d authenticated as %s\n", clientID, username)
-			continue
-		}
-
-		// Reject everything until authenticated
-		if !client.LoggedIn {
-			fmt.Fprintf(conn, "ERROR NOT_AUTHENTICATED\n")
-			continue
-		}
-
-		log.Printf("Client #%d cmd: %s\n", clientID, payload)
-
-		// --------------------
-		// COMMANDS
-		// --------------------
-		switch {
-		case payload == "PING":
-			fmt.Fprintf(conn, "PONG\n")
-
-		case payload == "CHAR_LIST":
-			rows, err := db.Query(
-				"SELECT name, class, level FROM characters WHERE username=$1",
-				client.Username,
-			)
-			if err != nil {
-				fmt.Fprintf(conn, "ERROR DB_FAILURE\n")
-				break
-			}
-			defer rows.Close()
-
-			for rows.Next() {
-				var name, class string
-				var level int
-				rows.Scan(&name, &class, &level)
-				fmt.Fprintf(conn, "CHAR %s %s %d\n", name, class, level)
-			}
-			fmt.Fprintf(conn, "CHAR_LIST_END\n")
-
-		case strings.HasPrefix(payload, "CHAR_CREATE "):
-			parts := strings.Split(payload, " ")
-			if len(parts) != 3 {
-				fmt.Fprintf(conn, "ERROR BAD_FORMAT\n")
-				break
-			}
-
-			name := parts[1]
-			class := parts[2]
-
-			_, err := db.Exec(
-				"INSERT INTO characters (username, name, class) VALUES ($1, $2, $3)",
-				client.Username, name, class,
-			)
-			if err != nil {
-				fmt.Fprintf(conn, "ERROR CHAR_CREATE_FAILED\n")
-				break
-			}
-
-			fmt.Fprintf(conn, "CHAR_CREATED %s\n", name)
-
-		case strings.HasPrefix(payload, "CHAR_SELECT "):
-			name := strings.TrimSpace(strings.TrimPrefix(payload, "CHAR_SELECT "))
-
-			var id int
-			err := db.QueryRow(
-				"SELECT id FROM characters WHERE username=$1 AND name=$2",
-				client.Username, name,
-			).Scan(&id)
-
-			if err != nil {
-				fmt.Fprintf(conn, "ERROR CHAR_NOT_FOUND\n")
-				break
-			}
-
-			client.CharacterID = id
-			client.Character = name
-
-			fmt.Fprintf(conn, "CHAR_SELECTED %s\n", name)
-			log.Printf("Client #%d selected character %s\n", clientID, name)
-
-		default:
-			fmt.Fprintf(conn, "ERROR UNKNOWN_COMMAND\n")
-		}
-	}
-
-	// Cleanup
-	clientsMutex.Lock()
-	delete(clients, clientID)
-	clientsMutex.Unlock()
-
-	log.Printf("Client #%d disconnected\n", clientID)
-}
-
-//
-// --------------------
-// Main
-// --------------------
-//
-
 func main() {
-	log.SetFlags(log.Ldate | log.Ltime)
-
-	cfg := loadConfig()
-
 	log.Println("=================================")
-	log.Println(cfg.ServerName)
+	log.Println("Project A3 Zone Server")
 	log.Println("Status: STARTED")
 	log.Println("=================================")
 
-	// Connect to DB
-	var err error
-	db, err = sql.Open(
-		"postgres",
-		"dbname=projecta3 sslmode=disable",
-	)
+	// Initialize worlds
+	worlds = DefaultWorlds()
+
+	log.Println("World status:")
+	for _, w := range worlds {
+		log.Printf(
+			" - %s (Lv %d–%d) | Unlocked=%v | AuraRequired=%v",
+			w.Name, w.MinLevel, w.MaxLevel, w.Unlocked, w.RequiresAura,
+		)
+	}
+
+	listener, err := net.Listen("tcp", ":7777")
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Failed to start ZoneServer: %v", err)
 	}
+	log.Println("ZoneServer listening on :7777")
 
-	if err = db.Ping(); err != nil {
-		log.Fatal("ZoneServer DB connection failed:", err)
-	}
+	ctx, cancel := context.WithCancel(context.Background())
 
-	log.Println("ZoneServer connected to DB")
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Handle shutdown
-	shutdown := make(chan os.Signal, 1)
-	signal.Notify(shutdown, syscall.SIGINT, syscall.SIGTERM)
-
-	listener := startTCPServer(cfg.ListenPort)
-	defer listener.Close()
-
-	// Accept connections
+	// Accept loop
 	go func() {
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
-				return
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					log.Printf("Accept error: %v", err)
+					continue
+				}
 			}
 			go handleClient(conn)
 		}
 	}()
 
-	// Tick loop
-	ticker := time.NewTicker(time.Duration(cfg.TickRateMs) * time.Millisecond)
-	defer ticker.Stop()
+	// Server tick
+	ticker := time.NewTicker(1 * time.Second)
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				log.Println("Server tick")
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
-	for {
-		select {
-		case <-ticker.C:
-			clientsMutex.Lock()
-			count := len(clients)
-			clientsMutex.Unlock()
-			log.Printf("Server tick | Connected clients: %d\n", count)
+	<-sigChan
+	log.Println("Shutdown signal received")
 
-		case <-shutdown:
-			log.Println("Shutdown signal received")
-			log.Println("ZoneServer shutting down cleanly...")
+	cancel()
+	ticker.Stop()
+	listener.Close()
+
+	log.Println("ZoneServer shut down cleanly")
+}
+
+// --------------------
+// CLIENT HANDLER
+// --------------------
+func handleClient(conn net.Conn) {
+	defer conn.Close()
+
+	log.Printf("Client connected: %s", conn.RemoteAddr())
+
+	session := NewSession(conn)
+	registerSession(session)
+	defer unregisterSession(session)
+
+	character := MockCharacter()
+	world := worlds[character.WorldID]
+
+	ok, reason := canEnterWorld(character, world)
+	if !ok {
+		sendMessage(conn, ServerMessage{
+			Command: "ENTER_DENIED",
+			Payload: reason,
+		})
+		return
+	}
+
+	session.Character = character
+	session.World = world
+	session.Position = DefaultSpawnPosition(world.ID)
+
+	sendMessage(conn, ServerMessage{
+		Command: "ENTER_OK",
+		Payload: map[string]interface{}{
+			"character": character.Name,
+			"world":     world.Name,
+			"spawn":     session.Position,
+		},
+	})
+
+	// Track visibility
+	visible := make(map[*ClientSession]bool)
+
+	// Initial visibility sync
+	forEachSession(func(other *ClientSession) {
+		if other == session {
 			return
 		}
+		if other.World.ID != session.World.ID {
+			return
+		}
+		if isVisible(other.Position, session.Position) {
+			sendMessage(other.Conn, ServerMessage{
+				Command: "PLAYER_JOINED",
+				Payload: map[string]interface{}{
+					"name": session.Character.Name,
+					"pos":  session.Position,
+				},
+			})
+			sendMessage(session.Conn, ServerMessage{
+				Command: "PLAYER_JOINED",
+				Payload: map[string]interface{}{
+					"name": other.Character.Name,
+					"pos":  other.Position,
+				},
+			})
+			visible[other] = true
+		}
+	})
+
+	reader := bufio.NewScanner(conn)
+
+	for session.Active && reader.Scan() {
+		var msg ClientMessage
+		if err := json.Unmarshal(reader.Bytes(), &msg); err != nil {
+			continue
+		}
+
+		switch msg.Command {
+
+		case "MOVE":
+			data, _ := json.Marshal(msg.Payload)
+			var move MoveRequest
+			if err := json.Unmarshal(data, &move); err != nil {
+				continue
+			}
+
+			newPos := Position{X: move.X, Y: move.Y, Z: move.Z}
+
+			if !isMoveValid(session.Position, newPos) {
+				sendMessage(conn, ServerMessage{
+					Command: "MOVE_REJECTED",
+					Payload: "INVALID_MOVE",
+				})
+				continue
+			}
+
+			session.Position = newPos
+
+			sendMessage(conn, ServerMessage{
+				Command: "MOVE_OK",
+				Payload: session.Position,
+			})
+
+			forEachSession(func(other *ClientSession) {
+				if other == session {
+					return
+				}
+				if other.World.ID != session.World.ID {
+					return
+				}
+
+				nowVisible := isVisible(other.Position, session.Position)
+				wasVisible := visible[other]
+
+				switch {
+				case nowVisible && !wasVisible:
+					sendMessage(other.Conn, ServerMessage{
+						Command: "PLAYER_JOINED",
+						Payload: map[string]interface{}{
+							"name": session.Character.Name,
+							"pos":  session.Position,
+						},
+					})
+					sendMessage(session.Conn, ServerMessage{
+						Command: "PLAYER_JOINED",
+						Payload: map[string]interface{}{
+							"name": other.Character.Name,
+							"pos":  other.Position,
+						},
+					})
+					visible[other] = true
+
+				case !nowVisible && wasVisible:
+					sendMessage(other.Conn, ServerMessage{
+						Command: "PLAYER_LEFT",
+						Payload: session.Character.Name,
+					})
+					sendMessage(session.Conn, ServerMessage{
+						Command: "PLAYER_LEFT",
+						Payload: other.Character.Name,
+					})
+					delete(visible, other)
+
+				case nowVisible && wasVisible:
+					sendMessage(other.Conn, ServerMessage{
+						Command: "PLAYER_MOVED",
+						Payload: map[string]interface{}{
+							"name": session.Character.Name,
+							"pos":  session.Position,
+						},
+					})
+				}
+			})
+		}
 	}
+
+	// Disconnect cleanup
+	for other := range visible {
+		sendMessage(other.Conn, ServerMessage{
+			Command: "PLAYER_LEFT",
+			Payload: session.Character.Name,
+		})
+	}
+
+	log.Printf("Client disconnected: %s", conn.RemoteAddr())
 }
+
