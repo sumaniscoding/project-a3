@@ -1,9 +1,6 @@
 package main
 
-import (
-	"math/rand"
-	"time"
-)
+import "time"
 
 func initWorldEntities() {
 	mobMu.Lock()
@@ -97,15 +94,26 @@ func attackMob(s *ClientSession, mobID, skillID string) (map[string]interface{},
 		"defeated":  false,
 		"xp_gain":   0,
 		"legendary": nil,
+		"drops":     []map[string]interface{}{},
 	}
 
 	if mob.HP <= 0 {
 		xpGain := 35 + mob.Level*4
 		leveled := gainXP(s.Character, xpGain)
+		drops := rollLootForMob(s.Character, mob.ID)
 		drop := maybeLegendaryDrop(s.Character)
+		if drop != nil {
+			drops = append(drops, map[string]interface{}{
+				"kind":    lootKindGear,
+				"item_id": drop.ID,
+				"qty":     1,
+				"item":    *drop,
+			})
+		}
 		result["defeated"] = true
 		result["xp_gain"] = xpGain
 		result["leveled_up"] = leveled
+		result["drops"] = drops
 		result["legendary"] = drop
 
 		respawnAfter := time.Duration(mob.RespawnSec) * time.Second
@@ -129,6 +137,6 @@ func respawnMob(worldID WorldID, mobID string, wait time.Duration) {
 		return
 	}
 	mob.HP = mob.MaxHP
-	mob.Position.X += float64(rand.Intn(5) - 2)
-	mob.Position.Z += float64(rand.Intn(5) - 2)
+	mob.Position.X += float64(randIntn(5) - 2)
+	mob.Position.Z += float64(randIntn(5) - 2)
 }

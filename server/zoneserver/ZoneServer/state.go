@@ -23,6 +23,7 @@ func statePayload(s *ClientSession) map[string]interface{} {
 		"pk_score":     c.PKScore,
 		"honor":        c.Honor,
 		"inventory":    c.Inventory,
+		"materials":    c.Materials,
 		"equipped":     c.Equipped,
 		"corpse":       c.Corpse,
 		"history":      getUnlockHistoryPayload(),

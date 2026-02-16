@@ -6,6 +6,11 @@ import (
 	"strings"
 )
 
+var (
+	randIntn    = rand.Intn
+	randFloat64 = rand.Float64
+)
+
 func gainXP(c *Character, amount int) (leveled bool) {
 	if amount <= 0 {
 		return false
@@ -86,7 +91,7 @@ func calculateAttack(c *Character, targetLevel int) (damage int, died bool) {
 	}
 
 	base := (c.Level * 2) + 12 + gearAtk
-	damage = base + rand.Intn(8)
+	damage = base + randIntn(8)
 	damage += damage * bonusPct / 100
 
 	risk := targetLevel - c.Level
@@ -95,7 +100,7 @@ func calculateAttack(c *Character, targetLevel int) (damage int, died bool) {
 		if chance > 0.8 {
 			chance = 0.8
 		}
-		if rand.Float64() < chance {
+		if randFloat64() < chance {
 			died = true
 		}
 	}
@@ -104,19 +109,19 @@ func calculateAttack(c *Character, targetLevel int) (damage int, died bool) {
 
 func maybeLegendaryDrop(c *Character) *Item {
 	// Extreme rarity for Grace/Soul.
-	if rand.Intn(1500) != 0 {
+	if randIntn(1500) != 0 {
 		return nil
 	}
 
 	kind := "Grace"
 	element := ElementLight
-	if rand.Intn(2) == 1 {
+	if randIntn(2) == 1 {
 		kind = "Soul"
 		element = ElementDark
 	}
 
 	item := Item{
-		ID:        fmt.Sprintf("legendary_%s_%d", strings.ToLower(kind), rand.Intn(1_000_000)),
+		ID:        fmt.Sprintf("legendary_%s_%d", strings.ToLower(kind), randIntn(1_000_000)),
 		Name:      kind + " Relic",
 		Grade:     10,
 		Rarity:    RarityUnique,

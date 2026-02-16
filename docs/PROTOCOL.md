@@ -77,6 +77,8 @@ Responses:
 - `ENTER_WORLD` with payload `{"world_id":2}` to switch worlds when unlocked
 - `TALK_NPC` with payload `{"npc":"Elder Rowan","choice":"honor"}` updates trust
 - `ACCEPT_QUEST` and `COMPLETE_QUEST` for owner-bound quest progression
+- `GET_RECIPES` to list crafting recipes and known material definitions
+- `CRAFT_ITEM` with payload `{"recipe_id":"wolfhide_bow","qty":1}` to craft gear from stackable materials
 
 Quest-related behavior implemented from the GDD:
 
@@ -96,6 +98,7 @@ Quest-related behavior implemented from the GDD:
 - `RECRUIT_MERC` to recruit class-based mercenary support
 - `SET_ELEMENT` with payload `{"target":"weapon|armor|pet","element":"Fire|Ice|Lightning|Earth|Light|Dark"}`
 - `SKILL_TREE` and `LEARN_SKILL` for class skill progression
+- `GET_RECIPES` and `CRAFT_ITEM` for the Epic 4 loot/crafting loop
 
 Combat/progression behaviors:
 
@@ -104,8 +107,21 @@ Combat/progression behaviors:
 - PvP penalty scaling based on attacker-victim level difference
 - PvP target resolution is session-based (`target` must be an online character name in same world and range)
 - runtime mobs with HP, defeat, and respawn timers
+- mob-specific loot tables that can drop stackable materials and occasional gear template rewards
 - extreme-rarity legendary drop roll for Grace/Soul items
 - gear grades and rarity tiers influence attack output
+
+Crafting behaviors:
+
+- recipe catalog is server-defined (code-driven)
+- `CRAFT_ITEM` validates recipe existence, level, quantity (`1..20`), and material sufficiency
+- successful crafting consumes `materials` and appends unique crafted gear into `inventory`
+- `STATE` now includes additive `materials` data without removing any existing fields
+
+`MOB_ATTACK_RESULT` additive payload field:
+
+- `drops`: array describing material and gear rewards when `defeated=true`
+- existing `legendary` field remains unchanged for backward compatibility
 
 ### Persistence
 

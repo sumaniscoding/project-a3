@@ -333,6 +333,9 @@ func ensureCharacterDefaults(c *Character) {
 			"pet":    ElementNone,
 		}
 	}
+	if c.Materials == nil {
+		c.Materials = map[string]int{}
+	}
 	if c.Skills == nil {
 		c.Skills = map[string]int{}
 	}

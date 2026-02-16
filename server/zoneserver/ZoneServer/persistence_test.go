@@ -118,6 +118,51 @@ func TestJSONModeWritesLegacyFile(t *testing.T) {
 	}
 }
 
+func TestDBModePersistsCraftingState(t *testing.T) {
+	t.Cleanup(resetPersistenceRuntimeStateForTests)
+	resetPersistenceRuntimeStateForTests()
+	_ = os.Setenv("A3_PERSISTENCE_MODE", "db")
+
+	restoreWD := enterTempDir(t)
+	defer restoreWD()
+
+	c, err := loadCharacter("CraftHero", "Archer")
+	if err != nil {
+		t.Fatalf("loadCharacter: %v", err)
+	}
+	c.Materials["wolf_pelt"] = 2
+
+	origRand := randIntn
+	randIntn = func(n int) int { return 1 }
+	defer func() { randIntn = origRand }()
+
+	if _, ok, reason := craftItem(c, "wolfhide_bow", 1); !ok {
+		t.Fatalf("craftItem failed: %s", reason)
+	}
+	if err := persistCharacter(c); err != nil {
+		t.Fatalf("persistCharacter: %v", err)
+	}
+
+	reloaded, err := loadCharacter("CraftHero", "Archer")
+	if err != nil {
+		t.Fatalf("reload loadCharacter: %v", err)
+	}
+	if reloaded.Materials["wolf_pelt"] != 1 {
+		t.Fatalf("expected persisted material count 1, got %d", reloaded.Materials["wolf_pelt"])
+	}
+
+	foundCrafted := false
+	for _, item := range reloaded.Inventory {
+		if len(item.ID) >= len("crafted_wolfhide_bow_") && item.ID[:len("crafted_wolfhide_bow_")] == "crafted_wolfhide_bow_" {
+			foundCrafted = true
+			break
+		}
+	}
+	if !foundCrafted {
+		t.Fatalf("expected crafted wolfhide bow item in persisted inventory")
+	}
+}
+
 func enterTempDir(t *testing.T) func() {
 	t.Helper()
 	wd, err := os.Getwd()

@@ -20,6 +20,8 @@ const (
 	ReqSummonPet     = "SUMMON_PET"
 	ReqRecruitMerc   = "RECRUIT_MERC"
 	ReqEquipItem     = "EQUIP_ITEM"
+	ReqGetRecipes    = "GET_RECIPES"
+	ReqCraftItem     = "CRAFT_ITEM"
 )
 
 const (
@@ -60,6 +62,9 @@ const (
 	RespPlayerJoined      = "PLAYER_JOINED"
 	RespPlayerLeft        = "PLAYER_LEFT"
 	RespPlayerMoved       = "PLAYER_MOVED"
+	RespRecipes           = "RECIPES"
+	RespCraftOK           = "CRAFT_OK"
+	RespCraftRejected     = "CRAFT_REJECTED"
 )
 
 const (

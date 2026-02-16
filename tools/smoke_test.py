@@ -69,6 +69,12 @@ def test_zone(token):
         conn.send({"command": "SKILL_TREE"})
         conn.recv_until("SKILL_TREE", prefix="[zone]")
 
+        conn.send({"command": "GET_RECIPES"})
+        conn.recv_until("RECIPES", prefix="[zone]")
+
+        conn.send({"command": "CRAFT_ITEM", "payload": {"recipe_id": "unknown_recipe", "qty": 1}})
+        conn.recv_until("CRAFT_REJECTED", prefix="[zone]")
+
         conn.send({"command": "LEARN_SKILL", "payload": {"skill_id": "burst_arrow"}})
         conn.recv_until_any(["SKILL_LEARNED", "SKILL_REJECTED"], prefix="[zone]")
 
@@ -96,8 +102,22 @@ def test_zone(token):
         conn.send({"command": "SET_ELEMENT", "payload": {"target": "weapon", "element": "Fire"}})
         conn.recv_until("ELEMENT_SET", prefix="[zone]")
 
-        conn.send({"command": "ATTACK_MOB", "payload": {"mob_id": "mob_wolf_01", "skill_id": "burst_arrow"}})
-        conn.recv_until("MOB_ATTACK_RESULT", prefix="[zone]")
+        defeated = False
+        for _ in range(6):
+            conn.send({"command": "ATTACK_MOB", "payload": {"mob_id": "mob_wolf_01", "skill_id": "burst_arrow"}})
+            mob_result = conn.recv_until("MOB_ATTACK_RESULT", prefix="[zone]")
+            payload = mob_result.get("payload", {})
+            if payload.get("defeated"):
+                defeated = True
+                break
+            if payload.get("status") == "PLAYER_DIED":
+                conn.send({"command": "RECOVER_CORPSE"})
+                conn.recv_until("CORPSE_RECOVERY", prefix="[zone]")
+        if not defeated:
+            raise RuntimeError("failed to defeat mob_wolf_01 in smoke test")
+
+        conn.send({"command": "CRAFT_ITEM", "payload": {"recipe_id": "wolfhide_bow", "qty": 1}})
+        conn.recv_until("CRAFT_OK", prefix="[zone]")
 
         conn.send({"command": "ATTACK_PVP", "payload": {"target": "Lowbie", "skill_id": "burst_arrow"}})
         conn.recv_until("PVP_REJECTED", prefix="[zone]")
