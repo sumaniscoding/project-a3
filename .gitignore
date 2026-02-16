@@ -9,6 +9,14 @@ obj/
 # Logs
 *.log
 
+# Runtime character persistence
+server/zoneserver/ZoneServer/data/characters/*.json
+server/zoneserver/ZoneServer/data/characters.db
+server/zoneserver/ZoneServer/data/characters.db-shm
+server/zoneserver/ZoneServer/data/characters.db-wal
+server/zoneserver/ZoneServer/zoneserver
+server/LoginServer/loginserver
+
 # Unity (future)
 Library/
 Temp/
