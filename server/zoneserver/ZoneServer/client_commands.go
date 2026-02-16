@@ -222,6 +222,22 @@ func handleClientCommand(conn net.Conn, session *ClientSession, visible map[*Cli
 		}
 		sendMessage(conn, ServerMessage{Command: RespEquipRejected, Payload: "ITEM_NOT_FOUND"})
 		return true, false
+	case ReqGetRecipes:
+		sendMessage(conn, ServerMessage{Command: RespRecipes, Payload: recipesPayload()})
+		return true, false
+	case ReqCraftItem:
+		payload := toMap(rawPayload)
+		qty := toInt(payload, "qty")
+		if qty == 0 {
+			qty = 1
+		}
+		result, ok, reason := craftItem(session.Character, toString(payload, "recipe_id"), qty)
+		if !ok {
+			sendMessage(conn, ServerMessage{Command: RespCraftRejected, Payload: reason})
+			return true, false
+		}
+		sendMessage(conn, ServerMessage{Command: RespCraftOK, Payload: result})
+		return true, true
 	default:
 		return false, false
 	}

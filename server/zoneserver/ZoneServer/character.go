@@ -19,6 +19,7 @@ type Character struct {
 	Pet            PetState
 	Mercenary      MercenaryState
 	Elemental      map[string]Element
+	Materials      map[string]int
 	SkillPoints    int
 	Skills         map[string]int
 	PKScore        int
@@ -61,6 +62,7 @@ func MockCharacter() *Character {
 			"armor":  ElementNone,
 			"pet":    ElementNone,
 		},
+		Materials:   map[string]int{},
 		SkillPoints: 3,
 		Skills: map[string]int{
 			"precise_shot": 1,

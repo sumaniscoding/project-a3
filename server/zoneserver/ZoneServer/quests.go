@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"math/rand"
 	"strings"
 )
 
@@ -45,7 +44,7 @@ func applyQuestCompletion(c *Character, questID string) (map[string]interface{},
 		reward["first_unlock"] = first
 		if !first {
 			alt := Item{
-				ID:      fmt.Sprintf("shattered_medal_%d", rand.Intn(1_000_000)),
+				ID:      fmt.Sprintf("shattered_medal_%d", randIntn(1_000_000)),
 				Name:    "Shattered Champion Medal",
 				Grade:   7,
 				Rarity:  RarityEpic,
@@ -63,7 +62,7 @@ func applyQuestCompletion(c *Character, questID string) (map[string]interface{},
 		reward["first_unlock"] = first
 	case "grace_legacy":
 		it := Item{
-			ID:        fmt.Sprintf("grace_quest_%d", rand.Intn(1_000_000)),
+			ID:        fmt.Sprintf("grace_quest_%d", randIntn(1_000_000)),
 			Name:      "Grace Relic",
 			Grade:     10,
 			Rarity:    RarityUnique,
@@ -75,7 +74,7 @@ func applyQuestCompletion(c *Character, questID string) (map[string]interface{},
 		reward["item"] = it
 	case "soul_legacy":
 		it := Item{
-			ID:        fmt.Sprintf("soul_quest_%d", rand.Intn(1_000_000)),
+			ID:        fmt.Sprintf("soul_quest_%d", randIntn(1_000_000)),
 			Name:      "Soul Relic",
 			Grade:     10,
 			Rarity:    RarityUnique,
