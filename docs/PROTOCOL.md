@@ -79,6 +79,11 @@ Responses:
 - `ACCEPT_QUEST` and `COMPLETE_QUEST` for owner-bound quest progression
 - `GET_RECIPES` to list crafting recipes and known material definitions
 - `CRAFT_ITEM` with payload `{"recipe_id":"wolfhide_bow","qty":1}` to craft gear from stackable materials
+- `CHAT_SAY` with payload `{"message":"hello"}` for local proximity chat in current world
+- `CHAT_WORLD` with payload `{"message":"hello world"}` for world-wide chat in current world
+- `WHO` for authenticated online roster
+- `PARTY_INVITE`, `PARTY_ACCEPT`, `PARTY_LEAVE` for party flow
+- `GUILD_CREATE`, `GUILD_JOIN`, `GUILD_LEAVE`, `GUILD_LIST` for guild scaffold flow
 
 Quest-related behavior implemented from the GDD:
 
@@ -117,11 +122,19 @@ Crafting behaviors:
 - `CRAFT_ITEM` validates recipe existence, level, quantity (`1..20`), and material sufficiency
 - successful crafting consumes `materials` and appends unique crafted gear into `inventory`
 - `STATE` now includes additive `materials` data without removing any existing fields
+- `STATE` also includes additive `guild` and `party` fields
 
 `MOB_ATTACK_RESULT` additive payload field:
 
 - `drops`: array describing material and gear rewards when `defeated=true`
 - existing `legendary` field remains unchanged for backward compatibility
+
+Social response messages:
+
+- `CHAT_MESSAGE` broadcast payload includes `channel`, `from`, `world`, `message`, `ts`
+- `WHO_LIST` returns online character metadata
+- party uses `PARTY_INVITE`, `PARTY_UPDATE`, and `PARTY_REJECTED`
+- guild uses `GUILD_UPDATE`, `GUILD_LIST`, and `GUILD_REJECTED`
 
 ### Persistence
 

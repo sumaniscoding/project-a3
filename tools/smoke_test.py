@@ -66,6 +66,40 @@ def test_zone(token):
         conn.send({"command": "GET_STATE"})
         conn.recv_until("STATE", prefix="[zone]")
 
+        conn.send({"command": "WHO"})
+        conn.recv_until("WHO_LIST", prefix="[zone]")
+
+        conn.send({"command": "CHAT_SAY", "payload": {"message": "hello local"}})
+        conn.recv_until("CHAT_MESSAGE", prefix="[zone]")
+
+        conn.send({"command": "CHAT_WORLD", "payload": {"message": "hello world"}})
+        conn.recv_until("CHAT_MESSAGE", prefix="[zone]")
+
+        conn.send({"command": "PARTY_INVITE", "payload": {"target": "SmokeHero"}})
+        conn.recv_until("PARTY_REJECTED", prefix="[zone]")
+
+        conn.send({"command": "PARTY_ACCEPT", "payload": {"from": "Nobody"}})
+        conn.recv_until("PARTY_REJECTED", prefix="[zone]")
+
+        conn.send({"command": "PARTY_LEAVE"})
+        conn.recv_until("PARTY_REJECTED", prefix="[zone]")
+
+        conn.send({"command": "GUILD_LIST"})
+        conn.recv_until("GUILD_LIST", prefix="[zone]")
+
+        conn.send({"command": "GUILD_LEAVE"})
+        conn.recv_until_any(["GUILD_UPDATE", "GUILD_REJECTED"], prefix="[zone]")
+
+        guild_name = f"SmokeGuild_{int(time.time())}"
+        conn.send({"command": "GUILD_CREATE", "payload": {"name": guild_name}})
+        conn.recv_until("GUILD_UPDATE", prefix="[zone]")
+
+        conn.send({"command": "GUILD_LIST"})
+        conn.recv_until("GUILD_LIST", prefix="[zone]")
+
+        conn.send({"command": "GUILD_LEAVE"})
+        conn.recv_until("GUILD_UPDATE", prefix="[zone]")
+
         conn.send({"command": "SKILL_TREE"})
         conn.recv_until("SKILL_TREE", prefix="[zone]")
 

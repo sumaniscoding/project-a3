@@ -238,6 +238,113 @@ func handleClientCommand(conn net.Conn, session *ClientSession, visible map[*Cli
 		}
 		sendMessage(conn, ServerMessage{Command: RespCraftOK, Payload: result})
 		return true, true
+	case ReqChatSay:
+		payload := toMap(rawPayload)
+		message := sanitizeChatMessage(toString(payload, "message"))
+		if message == "" {
+			sendMessage(conn, ServerMessage{Command: RespError, Payload: "MESSAGE_REQUIRED"})
+			return true, false
+		}
+		broadcastSay(session, message)
+		return true, false
+	case ReqChatWorld:
+		payload := toMap(rawPayload)
+		message := sanitizeChatMessage(toString(payload, "message"))
+		if message == "" {
+			sendMessage(conn, ServerMessage{Command: RespError, Payload: "MESSAGE_REQUIRED"})
+			return true, false
+		}
+		broadcastWorld(session, message)
+		return true, false
+	case ReqWho:
+		sendMessage(conn, ServerMessage{Command: RespWhoList, Payload: whoPayload()})
+		return true, false
+	case ReqPartyInvite:
+		payload := toMap(rawPayload)
+		target := toString(payload, "target")
+		targetSession := findSessionByCharacterName(target)
+		if targetSession == nil || !targetSession.Authenticated {
+			sendMessage(conn, ServerMessage{Command: RespPartyRejected, Payload: "TARGET_OFFLINE"})
+			return true, false
+		}
+		result, ok, reason := partyInvite(session.Character.Name, target)
+		if !ok {
+			sendMessage(conn, ServerMessage{Command: RespPartyRejected, Payload: reason})
+			return true, false
+		}
+		sendMessage(targetSession.Conn, ServerMessage{Command: RespPartyInvite, Payload: map[string]interface{}{"from": session.Character.Name}})
+		sendMessage(conn, ServerMessage{Command: RespPartyUpdate, Payload: map[string]interface{}{"event": "INVITE_SENT", "invite": result}})
+		return true, false
+	case ReqPartyAccept:
+		payload := toMap(rawPayload)
+		result, ok, reason := partyAccept(session.Character.Name, toString(payload, "from"))
+		if !ok {
+			sendMessage(conn, ServerMessage{Command: RespPartyRejected, Payload: reason})
+			return true, false
+		}
+		partyMap := toMap(result["party"])
+		partyID := toString(partyMap, "id")
+		notifyPartyMembers(partyID, "MEMBER_JOINED", session.Character.Name)
+		sendMessage(conn, ServerMessage{Command: RespPartyUpdate, Payload: map[string]interface{}{"event": "JOINED", "party": result["party"]}})
+		return true, false
+	case ReqPartyLeave:
+		result, ok, reason := partyLeave(session.Character.Name)
+		if !ok {
+			sendMessage(conn, ServerMessage{Command: RespPartyRejected, Payload: reason})
+			return true, false
+		}
+		if dissolved, _ := result["dissolved"].(bool); dissolved {
+			sendMessage(conn, ServerMessage{Command: RespPartyUpdate, Payload: map[string]interface{}{"event": "PARTY_DISSOLVED"}})
+			return true, false
+		}
+		partyMap := toMap(result["party"])
+		partyID := toString(partyMap, "id")
+		notifyPartyMembers(partyID, "MEMBER_LEFT", session.Character.Name)
+		sendMessage(conn, ServerMessage{Command: RespPartyUpdate, Payload: map[string]interface{}{"event": "LEFT", "party": nil}})
+		return true, false
+	case ReqGuildCreate:
+		if strings.TrimSpace(session.Character.Guild) != "" {
+			sendMessage(conn, ServerMessage{Command: RespGuildRejected, Payload: "ALREADY_IN_GUILD"})
+			return true, false
+		}
+		payload := toMap(rawPayload)
+		result, ok, reason := guildCreate(session.Character.Name, toString(payload, "name"))
+		if !ok {
+			sendMessage(conn, ServerMessage{Command: RespGuildRejected, Payload: reason})
+			return true, false
+		}
+		session.Character.Guild = toString(result, "guild")
+		registerGuildMember(session.Character.Guild, session.Character.Name)
+		sendMessage(conn, ServerMessage{Command: RespGuildUpdate, Payload: map[string]interface{}{"event": "CREATED", "guild": session.Character.Guild}})
+		return true, true
+	case ReqGuildJoin:
+		if strings.TrimSpace(session.Character.Guild) != "" {
+			sendMessage(conn, ServerMessage{Command: RespGuildRejected, Payload: "ALREADY_IN_GUILD"})
+			return true, false
+		}
+		payload := toMap(rawPayload)
+		result, ok, reason := guildJoin(session.Character.Name, toString(payload, "name"))
+		if !ok {
+			sendMessage(conn, ServerMessage{Command: RespGuildRejected, Payload: reason})
+			return true, false
+		}
+		session.Character.Guild = toString(result, "guild")
+		registerGuildMember(session.Character.Guild, session.Character.Name)
+		sendMessage(conn, ServerMessage{Command: RespGuildUpdate, Payload: map[string]interface{}{"event": "JOINED", "guild": session.Character.Guild}})
+		return true, true
+	case ReqGuildLeave:
+		result, ok, reason := guildLeave(session.Character.Name, session.Character.Guild)
+		if !ok {
+			sendMessage(conn, ServerMessage{Command: RespGuildRejected, Payload: reason})
+			return true, false
+		}
+		oldGuild := toString(result, "guild")
+		session.Character.Guild = ""
+		sendMessage(conn, ServerMessage{Command: RespGuildUpdate, Payload: map[string]interface{}{"event": "LEFT", "guild": oldGuild}})
+		return true, true
+	case ReqGuildList:
+		sendMessage(conn, ServerMessage{Command: RespGuildList, Payload: guildListPayload()})
+		return true, false
 	default:
 		return false, false
 	}
@@ -291,6 +398,7 @@ func handleAuthToken(conn net.Conn, session *ClientSession, visible map[*ClientS
 	}
 	bindSessionCharacterName(session, loaded.Name)
 	*boundName = loaded.Name
+	registerGuildMember(loaded.Guild, loaded.Name)
 
 	sendMessage(conn, ServerMessage{Command: RespAuthOK, Payload: map[string]interface{}{"name": loaded.Name, "class": loaded.Class, "world": targetWorld.Name}})
 	sendMessage(conn, ServerMessage{Command: RespEnterOK, Payload: map[string]interface{}{"character": loaded.Name, "world": targetWorld.Name, "spawn": session.Position}})
@@ -362,5 +470,27 @@ func canonicalClassName(raw string) string {
 		return "Rogue"
 	default:
 		return ""
+	}
+}
+
+func notifyPartyMembers(partyID, event, actor string) {
+	memberNames := partyMemberNames(partyID)
+	if len(memberNames) == 0 {
+		return
+	}
+	partyState := partySnapshotForCharacter(memberNames[0])
+	for _, name := range memberNames {
+		target := findSessionByCharacterName(name)
+		if target == nil || !target.Authenticated {
+			continue
+		}
+		sendMessage(target.Conn, ServerMessage{
+			Command: RespPartyUpdate,
+			Payload: map[string]interface{}{
+				"event": event,
+				"actor": actor,
+				"party": partyState,
+			},
+		})
 	}
 }
