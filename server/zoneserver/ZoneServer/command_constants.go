@@ -22,6 +22,16 @@ const (
 	ReqEquipItem     = "EQUIP_ITEM"
 	ReqGetRecipes    = "GET_RECIPES"
 	ReqCraftItem     = "CRAFT_ITEM"
+	ReqChatSay       = "CHAT_SAY"
+	ReqChatWorld     = "CHAT_WORLD"
+	ReqWho           = "WHO"
+	ReqPartyInvite   = "PARTY_INVITE"
+	ReqPartyAccept   = "PARTY_ACCEPT"
+	ReqPartyLeave    = "PARTY_LEAVE"
+	ReqGuildCreate   = "GUILD_CREATE"
+	ReqGuildJoin     = "GUILD_JOIN"
+	ReqGuildLeave    = "GUILD_LEAVE"
+	ReqGuildList     = "GUILD_LIST"
 )
 
 const (
@@ -65,6 +75,14 @@ const (
 	RespRecipes           = "RECIPES"
 	RespCraftOK           = "CRAFT_OK"
 	RespCraftRejected     = "CRAFT_REJECTED"
+	RespChatMessage       = "CHAT_MESSAGE"
+	RespWhoList           = "WHO_LIST"
+	RespPartyInvite       = "PARTY_INVITE"
+	RespPartyUpdate       = "PARTY_UPDATE"
+	RespPartyRejected     = "PARTY_REJECTED"
+	RespGuildUpdate       = "GUILD_UPDATE"
+	RespGuildList         = "GUILD_LIST"
+	RespGuildRejected     = "GUILD_REJECTED"
 )
 
 const (

@@ -20,6 +20,7 @@ type Character struct {
 	Mercenary      MercenaryState
 	Elemental      map[string]Element
 	Materials      map[string]int
+	Guild          string
 	SkillPoints    int
 	Skills         map[string]int
 	PKScore        int

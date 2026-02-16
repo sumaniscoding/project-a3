@@ -27,5 +27,7 @@ func statePayload(s *ClientSession) map[string]interface{} {
 		"equipped":     c.Equipped,
 		"corpse":       c.Corpse,
 		"history":      getUnlockHistoryPayload(),
+		"guild":        c.Guild,
+		"party":        partySnapshotForCharacter(c.Name),
 	}
 }

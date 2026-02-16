@@ -19,6 +19,9 @@ func unregisterSession(s *ClientSession) {
 	defer sessionsMu.Unlock()
 	delete(sessions, s)
 	if s.Character != nil && s.Character.Name != "" {
+		go handleSocialDisconnect(s.Character.Name)
+	}
+	if s.Character != nil && s.Character.Name != "" {
 		if current, ok := sessionsByName[s.Character.Name]; ok && current == s {
 			delete(sessionsByName, s.Character.Name)
 		}
