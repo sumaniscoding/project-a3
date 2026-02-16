@@ -84,6 +84,8 @@ Responses:
 - `WHO` for authenticated online roster
 - `PARTY_INVITE`, `PARTY_ACCEPT`, `PARTY_LEAVE` for party flow
 - `GUILD_CREATE`, `GUILD_JOIN`, `GUILD_LEAVE`, `GUILD_LIST` for guild scaffold flow
+- `CHAT_GUILD` with payload `{"message":"hello guild"}` for guild channel chat
+- `GUILD_MEMBERS` to list guild roster and online state
 
 Quest-related behavior implemented from the GDD:
 
@@ -113,8 +115,10 @@ Combat/progression behaviors:
 - PvP target resolution is session-based (`target` must be an online character name in same world and range)
 - runtime mobs with HP, defeat, and respawn timers
 - mob-specific loot tables that can drop stackable materials and occasional gear template rewards
+- nearby party members receive shared XP on mob kills, and killers gain party bonus XP/loot when grouped
 - extreme-rarity legendary drop roll for Grace/Soul items
 - gear grades and rarity tiers influence attack output
+- `ATTACK_PVP` blocks same-party friendly fire by default (`FRIENDLY_FIRE_BLOCKED`)
 
 Crafting behaviors:
 
@@ -135,6 +139,7 @@ Social response messages:
 - `WHO_LIST` returns online character metadata
 - party uses `PARTY_INVITE`, `PARTY_UPDATE`, and `PARTY_REJECTED`
 - guild uses `GUILD_UPDATE`, `GUILD_LIST`, and `GUILD_REJECTED`
+- guild member roster uses `GUILD_MEMBERS`
 
 ### Persistence
 

@@ -97,6 +97,12 @@ def test_zone(token):
         conn.send({"command": "GUILD_LIST"})
         conn.recv_until("GUILD_LIST", prefix="[zone]")
 
+        conn.send({"command": "GUILD_MEMBERS"})
+        conn.recv_until("GUILD_MEMBERS", prefix="[zone]")
+
+        conn.send({"command": "CHAT_GUILD", "payload": {"message": "guild hello"}})
+        conn.recv_until("CHAT_MESSAGE", prefix="[zone]")
+
         conn.send({"command": "GUILD_LEAVE"})
         conn.recv_until("GUILD_UPDATE", prefix="[zone]")
 

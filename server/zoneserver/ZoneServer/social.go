@@ -77,6 +77,30 @@ func broadcastWorld(session *ClientSession, message string) {
 	})
 }
 
+func broadcastGuild(session *ClientSession, message string) bool {
+	guild := strings.TrimSpace(session.Character.Guild)
+	if guild == "" {
+		return false
+	}
+
+	payload := map[string]interface{}{
+		"channel": "guild",
+		"from":    session.Character.Name,
+		"guild":   guild,
+		"message": message,
+		"ts":      time.Now().UTC().Format(time.RFC3339),
+	}
+	recipients := guildMemberNames(guild)
+	for _, name := range recipients {
+		other := findSessionByCharacterName(name)
+		if other == nil || !other.Authenticated || other.Character == nil {
+			continue
+		}
+		sendMessage(other.Conn, ServerMessage{Command: RespChatMessage, Payload: payload})
+	}
+	return true
+}
+
 func whoPayload() map[string]interface{} {
 	list := make([]map[string]interface{}, 0)
 	forEachSession(func(s *ClientSession) {
@@ -216,6 +240,55 @@ func partyMemberNames(partyID string) []string {
 	return sortedMembersLocked(p.Members)
 }
 
+func arePartyMates(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	partyMu.RLock()
+	defer partyMu.RUnlock()
+	pa, okA := partyByMember[a]
+	pb, okB := partyByMember[b]
+	return okA && okB && pa != "" && pa == pb
+}
+
+func partyNearbyMembers(session *ClientSession) []*ClientSession {
+	if session == nil || session.Character == nil || session.World == nil {
+		return nil
+	}
+	partyMu.RLock()
+	partyID := partyByMember[session.Character.Name]
+	if partyID == "" {
+		partyMu.RUnlock()
+		return nil
+	}
+	p := parties[partyID]
+	if p == nil {
+		partyMu.RUnlock()
+		return nil
+	}
+	memberNames := sortedMembersLocked(p.Members)
+	partyMu.RUnlock()
+
+	out := make([]*ClientSession, 0)
+	for _, name := range memberNames {
+		if name == session.Character.Name {
+			continue
+		}
+		other := findSessionByCharacterName(name)
+		if other == nil || !other.Authenticated || other.Character == nil || other.World == nil {
+			continue
+		}
+		if other.World.ID != session.World.ID {
+			continue
+		}
+		if !isVisible(session.Position, other.Position) {
+			continue
+		}
+		out = append(out, other)
+	}
+	return out
+}
+
 func firstMemberLocked(members map[string]bool) string {
 	names := sortedMembersLocked(members)
 	if len(names) == 0 {
@@ -283,6 +356,51 @@ func registerGuildMember(guildName, member string) {
 		guildRoster[guild] = members
 	}
 	members[member] = true
+}
+
+func guildMemberNames(guildName string) []string {
+	guild := strings.TrimSpace(guildName)
+	if guild == "" {
+		return nil
+	}
+	guildMu.RLock()
+	defer guildMu.RUnlock()
+	members := guildRoster[guild]
+	if len(members) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(members))
+	for name := range members {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func guildMembersPayload(guildName string) (map[string]interface{}, bool) {
+	guild := strings.TrimSpace(guildName)
+	if guild == "" {
+		return nil, false
+	}
+	names := guildMemberNames(guild)
+	if len(names) == 0 {
+		return nil, false
+	}
+
+	members := make([]map[string]interface{}, 0, len(names))
+	for _, name := range names {
+		s := findSessionByCharacterName(name)
+		online := s != nil && s.Authenticated && s.Character != nil
+		members = append(members, map[string]interface{}{
+			"name":   name,
+			"online": online,
+		})
+	}
+	return map[string]interface{}{
+		"guild":   guild,
+		"members": members,
+		"count":   len(members),
+	}, true
 }
 
 func guildCreate(member, guildName string) (map[string]interface{}, bool, string) {

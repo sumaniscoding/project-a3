@@ -32,6 +32,8 @@ const (
 	ReqGuildJoin     = "GUILD_JOIN"
 	ReqGuildLeave    = "GUILD_LEAVE"
 	ReqGuildList     = "GUILD_LIST"
+	ReqChatGuild     = "CHAT_GUILD"
+	ReqGuildMembers  = "GUILD_MEMBERS"
 )
 
 const (
@@ -83,6 +85,7 @@ const (
 	RespGuildUpdate       = "GUILD_UPDATE"
 	RespGuildList         = "GUILD_LIST"
 	RespGuildRejected     = "GUILD_REJECTED"
+	RespGuildMembers      = "GUILD_MEMBERS"
 )
 
 const (

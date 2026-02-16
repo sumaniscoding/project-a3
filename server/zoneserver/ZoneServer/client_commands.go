@@ -166,6 +166,10 @@ func handleClientCommand(conn net.Conn, session *ClientSession, visible map[*Cli
 			sendMessage(conn, ServerMessage{Command: RespPVPRejected, Payload: "TARGET_OUT_OF_RANGE"})
 			return true, false
 		}
+		if arePartyMates(session.Character.Name, victimSession.Character.Name) {
+			sendMessage(conn, ServerMessage{Command: RespPVPRejected, Payload: "FRIENDLY_FIRE_BLOCKED"})
+			return true, false
+		}
 		result := attackPlayer(session, victimSession, toString(payload, "skill_id"))
 		sendMessage(conn, ServerMessage{Command: RespPVPResult, Payload: result})
 		sendMessage(victimSession.Conn, ServerMessage{Command: RespPVPHit, Payload: map[string]interface{}{"from": session.Character.Name, "damage": result["damage"], "target_hp": victimSession.Character.HP, "target_debt": victimSession.Character.XPDebt}})
@@ -256,6 +260,17 @@ func handleClientCommand(conn net.Conn, session *ClientSession, visible map[*Cli
 		}
 		broadcastWorld(session, message)
 		return true, false
+	case ReqChatGuild:
+		payload := toMap(rawPayload)
+		message := sanitizeChatMessage(toString(payload, "message"))
+		if message == "" {
+			sendMessage(conn, ServerMessage{Command: RespError, Payload: "MESSAGE_REQUIRED"})
+			return true, false
+		}
+		if !broadcastGuild(session, message) {
+			sendMessage(conn, ServerMessage{Command: RespGuildRejected, Payload: "NOT_IN_GUILD"})
+		}
+		return true, false
 	case ReqWho:
 		sendMessage(conn, ServerMessage{Command: RespWhoList, Payload: whoPayload()})
 		return true, false
@@ -344,6 +359,14 @@ func handleClientCommand(conn net.Conn, session *ClientSession, visible map[*Cli
 		return true, true
 	case ReqGuildList:
 		sendMessage(conn, ServerMessage{Command: RespGuildList, Payload: guildListPayload()})
+		return true, false
+	case ReqGuildMembers:
+		payload, ok := guildMembersPayload(session.Character.Guild)
+		if !ok {
+			sendMessage(conn, ServerMessage{Command: RespGuildRejected, Payload: "NOT_IN_GUILD"})
+			return true, false
+		}
+		sendMessage(conn, ServerMessage{Command: RespGuildMembers, Payload: payload})
 		return true, false
 	default:
 		return false, false
