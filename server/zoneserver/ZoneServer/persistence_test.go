@@ -163,6 +163,256 @@ func TestDBModePersistsCraftingState(t *testing.T) {
 	}
 }
 
+func TestDBModePersistsAccountState(t *testing.T) {
+	t.Cleanup(resetPersistenceRuntimeStateForTests)
+	resetPersistenceRuntimeStateForTests()
+	_ = os.Setenv("A3_PERSISTENCE_MODE", "db")
+
+	restoreWD := enterTempDir(t)
+	defer restoreWD()
+
+	a, err := loadAccount("AccountHero")
+	if err != nil {
+		t.Fatalf("loadAccount: %v", err)
+	}
+	a.WalletGold = 321
+	a.Storage.Materials["wolf_pelt"] = 7
+	a.Storage.Items = append(a.Storage.Items, Item{
+		ID:        "misc_token_1",
+		Name:      "Misc Token",
+		Slot:      "misc",
+		GearLevel: 1,
+	})
+	if err := persistAccount(a); err != nil {
+		t.Fatalf("persistAccount: %v", err)
+	}
+
+	reloaded, err := loadAccount("AccountHero")
+	if err != nil {
+		t.Fatalf("reload loadAccount: %v", err)
+	}
+	if reloaded.WalletGold != 321 {
+		t.Fatalf("expected wallet_gold=321, got %d", reloaded.WalletGold)
+	}
+	if reloaded.Storage.Materials["wolf_pelt"] != 7 {
+		t.Fatalf("expected stored wolf_pelt=7, got %d", reloaded.Storage.Materials["wolf_pelt"])
+	}
+	if len(reloaded.Storage.Items) != 1 || reloaded.Storage.Items[0].ID != "misc_token_1" {
+		t.Fatalf("expected one stored item, got %#v", reloaded.Storage.Items)
+	}
+}
+
+func TestJSONModeWritesLegacyAccountFile(t *testing.T) {
+	t.Cleanup(resetPersistenceRuntimeStateForTests)
+	resetPersistenceRuntimeStateForTests()
+	_ = os.Setenv("A3_PERSISTENCE_MODE", "json")
+
+	restoreWD := enterTempDir(t)
+	defer restoreWD()
+
+	a := newDefaultAccount("JsonAccount")
+	a.WalletGold = 99
+	if err := persistAccount(a); err != nil {
+		t.Fatalf("persistAccount: %v", err)
+	}
+
+	path := filepath.Join(accountStoreDir, sanitizeCharacterName(a.Username)+".json")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("account json file missing: %v", err)
+	}
+}
+
+func TestEnsureCharacterDefaultsInitializesFriends(t *testing.T) {
+	c := &Character{Name: "Friendless", Level: 1}
+	ensureCharacterDefaults(c)
+	if c.Friends == nil {
+		t.Fatalf("expected friends map initialized")
+	}
+	if c.Blocks == nil {
+		t.Fatalf("expected blocks map initialized")
+	}
+	if c.Presence != "online" {
+		t.Fatalf("expected default presence online, got %q", c.Presence)
+	}
+	c.Presence = "unknown_status"
+	ensureCharacterDefaults(c)
+	if c.Presence != "online" {
+		t.Fatalf("expected invalid presence coerced to online, got %q", c.Presence)
+	}
+}
+
+func TestNewDefaultHealingKnightHasStarterShield(t *testing.T) {
+	c := newDefaultCharacter("ShieldHero", "Healing Knight")
+	foundShield := false
+	for _, item := range c.Inventory {
+		if item.Slot == SlotShield && item.ID == "starter_shield" {
+			foundShield = true
+			break
+		}
+	}
+	if !foundShield {
+		t.Fatalf("expected starter_shield in Healing Knight loadout")
+	}
+}
+
+func TestNewDefaultCharacterClassLoadoutsAndStarterSkills(t *testing.T) {
+	tests := []struct {
+		class        string
+		weaponID     string
+		armorID      string
+		primarySkill string
+		expectShield bool
+	}{
+		{
+			class:        "Archer",
+			weaponID:     "starter_bow",
+			armorID:      "starter_mail",
+			primarySkill: "precise_shot",
+			expectShield: false,
+		},
+		{
+			class:        "Mage",
+			weaponID:     "starter_focus",
+			armorID:      "starter_robe",
+			primarySkill: "arc_bolt",
+			expectShield: false,
+		},
+		{
+			class:        "Warrior",
+			weaponID:     "starter_blade",
+			armorID:      "starter_plate",
+			primarySkill: "cleave",
+			expectShield: false,
+		},
+		{
+			class:        "Healing Knight",
+			weaponID:     "starter_mace",
+			armorID:      "starter_guard_mail",
+			primarySkill: "holy_slash",
+			expectShield: true,
+		},
+	}
+
+	for _, tc := range tests {
+		c := newDefaultCharacter("ClassHero_"+tc.class, tc.class)
+		if c.Class != tc.class {
+			t.Fatalf("expected class %s, got %s", tc.class, c.Class)
+		}
+		if !inventoryHasItem(c.Inventory, tc.weaponID) {
+			t.Fatalf("expected %s starter weapon in inventory", tc.weaponID)
+		}
+		if !inventoryHasItem(c.Inventory, tc.armorID) {
+			t.Fatalf("expected %s starter armor in inventory", tc.armorID)
+		}
+		foundShield := inventoryHasItem(c.Inventory, "starter_shield")
+		if foundShield != tc.expectShield {
+			t.Fatalf("shield presence mismatch for class %s: got=%v want=%v", tc.class, foundShield, tc.expectShield)
+		}
+
+		defs := skillListForClass(tc.class)
+		if len(c.Skills) != len(defs) {
+			t.Fatalf("expected only class skills for %s, got %#v", tc.class, c.Skills)
+		}
+		if c.Skills[tc.primarySkill] != 1 {
+			t.Fatalf("expected starter skill %s rank 1 for %s, got %d", tc.primarySkill, tc.class, c.Skills[tc.primarySkill])
+		}
+		for id := range defs {
+			if id == tc.primarySkill {
+				continue
+			}
+			if c.Skills[id] != 0 {
+				t.Fatalf("expected non-primary class skill %s rank 0 for %s, got %d", id, tc.class, c.Skills[id])
+			}
+		}
+
+		wantSTR, wantDEX := classStarterStats(tc.class)
+		if c.Strength != wantSTR || c.Dexterity != wantDEX {
+			t.Fatalf("unexpected class starter stats for %s: got str=%d dex=%d want str=%d dex=%d", tc.class, c.Strength, c.Dexterity, wantSTR, wantDEX)
+		}
+	}
+}
+
+func TestNewDefaultCharacterUnknownClassFallsBackToArcher(t *testing.T) {
+	c := newDefaultCharacter("FallbackHero", "Bard")
+	if c.Class != "Archer" {
+		t.Fatalf("expected Archer fallback class, got %s", c.Class)
+	}
+	if !inventoryHasItem(c.Inventory, "starter_bow") {
+		t.Fatalf("expected Archer starter bow on unknown class fallback")
+	}
+	if c.Skills["precise_shot"] != 1 {
+		t.Fatalf("expected Archer starter skill on unknown class fallback")
+	}
+}
+
+func TestLoadCharacterDBModeKeepsExistingClassOnAuthHint(t *testing.T) {
+	t.Cleanup(resetPersistenceRuntimeStateForTests)
+	resetPersistenceRuntimeStateForTests()
+	_ = os.Setenv("A3_PERSISTENCE_MODE", "db")
+
+	restoreWD := enterTempDir(t)
+	defer restoreWD()
+
+	created, err := loadCharacter("ClassLockDBHero", "Mage")
+	if err != nil {
+		t.Fatalf("loadCharacter create failed: %v", err)
+	}
+	if created.Class != "Mage" {
+		t.Fatalf("expected created class Mage, got %s", created.Class)
+	}
+	if err := persistCharacter(created); err != nil {
+		t.Fatalf("persistCharacter failed: %v", err)
+	}
+
+	reloaded, err := loadCharacter("ClassLockDBHero", "Warrior")
+	if err != nil {
+		t.Fatalf("loadCharacter reload failed: %v", err)
+	}
+	if reloaded.Class != "Mage" {
+		t.Fatalf("expected persisted class Mage to be retained, got %s", reloaded.Class)
+	}
+	if !inventoryHasItem(reloaded.Inventory, "starter_focus") {
+		t.Fatalf("expected Mage starter focus retained after re-auth hint")
+	}
+	if inventoryHasItem(reloaded.Inventory, "starter_blade") {
+		t.Fatalf("unexpected Warrior starter blade after re-auth hint")
+	}
+}
+
+func TestLoadCharacterJSONModeKeepsExistingClassOnAuthHint(t *testing.T) {
+	t.Cleanup(resetPersistenceRuntimeStateForTests)
+	resetPersistenceRuntimeStateForTests()
+	_ = os.Setenv("A3_PERSISTENCE_MODE", "json")
+
+	restoreWD := enterTempDir(t)
+	defer restoreWD()
+
+	created, err := loadCharacter("ClassLockJSONHero", "Warrior")
+	if err != nil {
+		t.Fatalf("loadCharacter create failed: %v", err)
+	}
+	if created.Class != "Warrior" {
+		t.Fatalf("expected created class Warrior, got %s", created.Class)
+	}
+	if err := persistCharacter(created); err != nil {
+		t.Fatalf("persistCharacter failed: %v", err)
+	}
+
+	reloaded, err := loadCharacter("ClassLockJSONHero", "Mage")
+	if err != nil {
+		t.Fatalf("loadCharacter reload failed: %v", err)
+	}
+	if reloaded.Class != "Warrior" {
+		t.Fatalf("expected persisted class Warrior to be retained, got %s", reloaded.Class)
+	}
+	if !inventoryHasItem(reloaded.Inventory, "starter_blade") {
+		t.Fatalf("expected Warrior starter blade retained after re-auth hint")
+	}
+	if inventoryHasItem(reloaded.Inventory, "starter_focus") {
+		t.Fatalf("unexpected Mage starter focus after re-auth hint")
+	}
+}
+
 func enterTempDir(t *testing.T) func() {
 	t.Helper()
 	wd, err := os.Getwd()
@@ -176,4 +426,13 @@ func enterTempDir(t *testing.T) func() {
 	return func() {
 		_ = os.Chdir(wd)
 	}
+}
+
+func inventoryHasItem(items []Item, itemID string) bool {
+	for _, item := range items {
+		if item.ID == itemID {
+			return true
+		}
+	}
+	return false
 }

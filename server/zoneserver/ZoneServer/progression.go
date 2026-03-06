@@ -36,8 +36,11 @@ func gainXP(c *Character, amount int) (leveled bool) {
 		c.MaxHP += 12
 		c.HP = c.MaxHP
 		c.SkillPoints++
+		c.Strength++
+		c.Dexterity++
 		leveled = true
 	}
+	applyCompanionProgress(c, amount)
 	return leveled
 }
 
@@ -73,7 +76,9 @@ func calculateAttack(c *Character, targetLevel int) (damage int, died bool) {
 		if c.Equipped[item.Slot] != item.ID {
 			continue
 		}
+		ensureItemDefaults(&item)
 		gearAtk += item.Grade * 2
+		gearAtk += maxInt(0, item.GearLevel-1)
 		if item.Rarity == RarityEpic {
 			gearAtk += 2
 		}
@@ -128,6 +133,9 @@ func maybeLegendaryDrop(c *Character) *Item {
 		Slot:      SlotWeapon,
 		Element:   element,
 		Legendary: true,
+		GearLevel: 1,
+		MinSTR:    40,
+		MinDEX:    40,
 	}
 	c.Inventory = append(c.Inventory, item)
 	return &item

@@ -40,16 +40,21 @@ func applyQuestCompletion(c *Character, questID string) (map[string]interface{},
 	case "unlock_world2_race":
 		first := unlockWorld(World2, c.Name)
 		c.UnlockedWorlds[World2] = true
+		c.Pet.Acquired = true
 		reward["world"] = World2
 		reward["first_unlock"] = first
+		reward["pet_unlocked"] = true
 		if !first {
 			alt := Item{
-				ID:      fmt.Sprintf("shattered_medal_%d", randIntn(1_000_000)),
-				Name:    "Shattered Champion Medal",
-				Grade:   7,
-				Rarity:  RarityEpic,
-				Slot:    SlotArmor,
-				Element: ElementEarth,
+				ID:        fmt.Sprintf("shattered_medal_%d", randIntn(1_000_000)),
+				Name:      "Shattered Champion Medal",
+				Grade:     7,
+				Rarity:    RarityEpic,
+				Slot:      SlotArmor,
+				Element:   ElementEarth,
+				GearLevel: 1,
+				MinSTR:    28,
+				MinDEX:    20,
 			}
 			c.Inventory = append(c.Inventory, alt)
 			reward["alternate_reward"] = alt
@@ -69,6 +74,9 @@ func applyQuestCompletion(c *Character, questID string) (map[string]interface{},
 			Slot:      SlotWeapon,
 			Element:   ElementLight,
 			Legendary: true,
+			GearLevel: 1,
+			MinSTR:    42,
+			MinDEX:    42,
 		}
 		c.Inventory = append(c.Inventory, it)
 		reward["item"] = it
@@ -81,6 +89,9 @@ func applyQuestCompletion(c *Character, questID string) (map[string]interface{},
 			Slot:      SlotWeapon,
 			Element:   ElementDark,
 			Legendary: true,
+			GearLevel: 1,
+			MinSTR:    42,
+			MinDEX:    42,
 		}
 		c.Inventory = append(c.Inventory, it)
 		reward["item"] = it

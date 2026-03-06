@@ -1,7 +1,8 @@
 package main
 
 func skillListForClass(class string) map[string]SkillDefinition {
-	list, ok := skillCatalog[class]
+	canonical := canonicalCharacterClass(class)
+	list, ok := skillCatalog[canonical]
 	if !ok {
 		return map[string]SkillDefinition{}
 	}

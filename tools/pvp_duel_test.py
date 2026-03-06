@@ -35,6 +35,12 @@ class JsonConn:
             self.sock.close()
 
 
+def expect_payload(msg, expected, label):
+    actual = msg.get("payload")
+    if actual != expected:
+        raise AssertionError(f"{label}: expected payload {expected!r}, got {actual!r}")
+
+
 def auth(conn, name):
     conn.recv_until("AUTH_REQUIRED")
     conn.send({"command": "AUTH_TOKEN", "payload": {"token": login_token(name), "class": "Archer"}})
@@ -57,12 +63,16 @@ def login_token(username):
 
 
 def main():
+    run_id = int(time.time())
+    name_a = f"DuelA_{run_id}"
+    name_b = f"DuelB_{run_id}"
+
     a = JsonConn("127.0.0.1", 7777)
     b = JsonConn("127.0.0.1", 7777)
 
     try:
-        auth(a, "DuelA")
-        auth(b, "DuelB")
+        auth(a, name_a)
+        auth(b, name_b)
 
         a.send({"command": "MOVE", "payload": {"x": 102.0, "y": 0.0, "z": 102.0}})
         a.recv_until("MOVE_OK")
@@ -70,7 +80,139 @@ def main():
         b.send({"command": "MOVE", "payload": {"x": 103.0, "y": 0.0, "z": 103.0}})
         b.recv_until("MOVE_OK")
 
-        a.send({"command": "ATTACK_PVP", "payload": {"target": "DuelB", "skill_id": "burst_arrow"}})
+        a.send({"command": "SET_PRESENCE", "payload": {"status": "online"}})
+        a.recv_until("PRESENCE_UPDATE")
+        b.send({"command": "SET_PRESENCE", "payload": {"status": "afk"}})
+        b.recv_until("PRESENCE_UPDATE")
+
+        # Friend flow: request -> cancel -> request -> decline -> request -> accept -> remove.
+        a.send({"command": "FRIEND_REQUEST", "payload": {"target": name_b}})
+        b.recv_until("FRIEND_UPDATE")
+        a.recv_until("FRIEND_UPDATE")
+        a.send({"command": "FRIEND_CANCEL_REQUEST", "payload": {"target": name_b}})
+        a.recv_until("FRIEND_UPDATE")
+        b.recv_until("FRIEND_UPDATE")
+        a.send({"command": "FRIEND_REQUEST", "payload": {"target": name_b}})
+        b.recv_until("FRIEND_UPDATE")
+        a.recv_until("FRIEND_UPDATE")
+        b.send({"command": "FRIEND_DECLINE", "payload": {"from": name_a}})
+        b.recv_until("FRIEND_UPDATE")
+        a.recv_until("FRIEND_UPDATE")
+        a.send({"command": "FRIEND_REQUEST", "payload": {"target": name_b}})
+        b.recv_until("FRIEND_UPDATE")
+        a.recv_until("FRIEND_UPDATE")
+        b.send({"command": "FRIEND_ACCEPT", "payload": {"from": name_a}})
+        b.recv_until("FRIEND_UPDATE")
+        a.recv_until("FRIEND_UPDATE")
+        a.send({"command": "FRIEND_STATUS"})
+        a.recv_until("FRIEND_STATUS")
+        a.send({"command": "FRIEND_REMOVE", "payload": {"target": name_b}})
+        a.recv_until("FRIEND_UPDATE")
+        b.recv_until("FRIEND_UPDATE")
+
+        # Block flow affects whisper delivery.
+        a.send({"command": "BLOCK_PLAYER", "payload": {"target": name_b}})
+        a.recv_until("BLOCK_UPDATE")
+        a.send({"command": "CHAT_WHISPER", "payload": {"target": name_b, "message": "blocked?"}})
+        a.recv_until("WHISPER_REJECTED")
+        a.send({"command": "UNBLOCK_PLAYER", "payload": {"target": name_b}})
+        a.recv_until("BLOCK_UPDATE")
+
+        # Direct whisper check.
+        a.send({"command": "CHAT_WHISPER", "payload": {"target": name_b, "message": "ready?"}})
+        b.recv_until("CHAT_MESSAGE")
+        a.recv_until("CHAT_MESSAGE")
+
+        # Blocked players cannot send party invites.
+        b.send({"command": "BLOCK_PLAYER", "payload": {"target": name_a}})
+        b.recv_until("BLOCK_UPDATE")
+        a.send({"command": "PARTY_INVITE", "payload": {"target": name_b}})
+        expect_payload(a.recv_until("PARTY_REJECTED"), "BLOCKED", "party invite while blocked")
+        b.send({"command": "UNBLOCK_PLAYER", "payload": {"target": name_a}})
+        b.recv_until("BLOCK_UPDATE")
+
+        # Guild invite flow: leader invites, target accepts.
+        a.send({"command": "GUILD_CREATE", "payload": {"name": f"DuelGuild_{int(time.time())}"}})
+        a.recv_until("GUILD_UPDATE")
+
+        # Blocked players cannot send guild invites.
+        b.send({"command": "BLOCK_PLAYER", "payload": {"target": name_a}})
+        b.recv_until("BLOCK_UPDATE")
+        a.send({"command": "GUILD_INVITE", "payload": {"target": name_b}})
+        expect_payload(a.recv_until("GUILD_REJECTED"), "BLOCKED", "guild invite while blocked")
+        b.send({"command": "UNBLOCK_PLAYER", "payload": {"target": name_a}})
+        b.recv_until("BLOCK_UPDATE")
+
+        a.send({"command": "GUILD_INVITE", "payload": {"target": name_b}})
+        b.recv_until("GUILD_UPDATE")
+        a.recv_until("GUILD_UPDATE")
+        a.send({"command": "GUILD_CANCEL_INVITE", "payload": {"target": name_b}})
+        a.recv_until("GUILD_UPDATE")
+        b.recv_until("GUILD_UPDATE")
+        a.send({"command": "GUILD_INVITE", "payload": {"target": name_b}})
+        b.recv_until("GUILD_UPDATE")
+        a.recv_until("GUILD_UPDATE")
+        b.send({"command": "GUILD_DECLINE", "payload": {"from": name_a}})
+        b.recv_until("GUILD_UPDATE")
+        a.recv_until("GUILD_UPDATE")
+        a.send({"command": "GUILD_INVITE", "payload": {"target": name_b}})
+        b.recv_until("GUILD_UPDATE")
+        a.recv_until("GUILD_UPDATE")
+        b.send({"command": "GUILD_ACCEPT", "payload": {"from": name_a}})
+        b.recv_until("GUILD_UPDATE")
+        a.send({"command": "GUILD_PROMOTE", "payload": {"target": name_b}})
+        a.recv_until("GUILD_UPDATE")
+        b.recv_until("GUILD_UPDATE")
+        a.send({"command": "GUILD_DEMOTE", "payload": {"target": name_b}})
+        a.recv_until("GUILD_UPDATE")
+        b.recv_until("GUILD_UPDATE")
+        a.send({"command": "GUILD_TRANSFER_LEADER", "payload": {"target": name_b}})
+        a.recv_until("GUILD_UPDATE")
+        b.recv_until("GUILD_UPDATE")
+        b.send({"command": "GUILD_KICK", "payload": {"target": name_a}})
+        a.recv_until("GUILD_UPDATE")
+        b.recv_until("GUILD_UPDATE")
+        b.send({"command": "GUILD_DISBAND"})
+        b.recv_until("GUILD_UPDATE")
+
+        # Party up first: friendly fire should be blocked.
+        a.send({"command": "PARTY_INVITE", "payload": {"target": name_b}})
+        b.recv_until("PARTY_INVITE")
+        a.recv_until("PARTY_UPDATE")
+
+        a.send({"command": "PARTY_CANCEL_INVITE", "payload": {"target": name_b}})
+        a.recv_until("PARTY_UPDATE")
+        b.recv_until("PARTY_UPDATE")
+
+        a.send({"command": "PARTY_INVITE", "payload": {"target": name_b}})
+        b.recv_until("PARTY_INVITE")
+        a.recv_until("PARTY_UPDATE")
+
+        b.send({"command": "PARTY_DECLINE", "payload": {"from": name_a}})
+        b.recv_until("PARTY_UPDATE")
+        a.recv_until("PARTY_UPDATE")
+
+        a.send({"command": "PARTY_INVITE", "payload": {"target": name_b}})
+        b.recv_until("PARTY_INVITE")
+        a.recv_until("PARTY_UPDATE")
+
+        b.send({"command": "PARTY_ACCEPT", "payload": {"from": name_a}})
+        b.recv_until("PARTY_UPDATE")
+        a.recv_until("PARTY_UPDATE")
+
+        a.send({"command": "PARTY_TRANSFER_LEADER", "payload": {"target": name_b}})
+        a.recv_until("PARTY_UPDATE")
+        b.recv_until("PARTY_UPDATE")
+
+        a.send({"command": "ATTACK_PVP", "payload": {"target": name_b, "skill_id": "burst_arrow"}})
+        print("[DuelA]", a.recv_until("PVP_REJECTED"))
+
+        # Disband party and try again: PvP should now resolve.
+        b.send({"command": "PARTY_DISBAND"})
+        b.recv_until("PARTY_UPDATE")
+        a.recv_until("PARTY_UPDATE")
+
+        a.send({"command": "ATTACK_PVP", "payload": {"target": name_b, "skill_id": "burst_arrow"}})
         print("[DuelA]", a.recv_until("PVP_RESULT"))
         print("[DuelB]", b.recv_until("PVP_HIT"))
     finally:

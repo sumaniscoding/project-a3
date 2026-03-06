@@ -143,7 +143,7 @@ func handleClient(conn net.Conn) {
 		if !session.Authenticated {
 			return
 		}
-		if err := persistCharacter(session.Character); err != nil {
+		if err := persistSessionState(session); err != nil {
 			log.Printf("Failed to persist character %s: %v", session.Character.Name, err)
 		}
 	}()
@@ -191,7 +191,7 @@ func handleClient(conn net.Conn) {
 		}
 
 		if modified {
-			if err := persistCharacter(session.Character); err != nil {
+			if err := persistSessionState(session); err != nil {
 				log.Printf("Failed to persist character %s: %v", session.Character.Name, err)
 			}
 		}
@@ -210,6 +210,22 @@ func handleClient(conn net.Conn) {
 	}
 
 	log.Printf("Client disconnected: %s", conn.RemoteAddr())
+}
+
+func persistSessionState(session *ClientSession) error {
+	if session == nil || session.Character == nil {
+		return nil
+	}
+	if err := persistCharacter(session.Character); err != nil {
+		return err
+	}
+	if session.Account != nil {
+		syncAccountFromCharacter(session.Account, session.Character)
+		if err := persistAccount(session.Account); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func toMap(v interface{}) map[string]interface{} {

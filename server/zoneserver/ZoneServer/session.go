@@ -8,6 +8,7 @@ import (
 type ClientSession struct {
 	Conn          net.Conn
 	Character     *Character
+	Account       *Account
 	World         *World
 	Position      Position
 	Active        bool
