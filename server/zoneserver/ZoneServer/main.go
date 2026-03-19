@@ -1,23 +1,30 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
-	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 var worlds map[WorldID]*World
 
 const authTimeout = 15 * time.Second
+
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  4096,
+	WriteBufferSize: 4096,
+	CheckOrigin:     checkWebSocketOrigin,
+}
 
 func canEnterWorld(c *Character, w *World) (bool, string) {
 	if w == nil {
@@ -36,15 +43,8 @@ func canEnterWorld(c *Character, w *World) (bool, string) {
 	return true, "OK"
 }
 
-func sendMessage(conn net.Conn, msg ServerMessage) {
-	data, err := json.Marshal(msg)
-	if err != nil {
-		log.Printf("Failed to marshal message: %v", err)
-		return
-	}
-	data = append(data, '\n')
-	_, err = conn.Write(data)
-	if err != nil {
+func sendMessage(conn WSConn, msg ServerMessage) {
+	if err := conn.WriteJSON(msg); err != nil {
 		log.Printf("Failed to write message: %v", err)
 	}
 }
@@ -71,39 +71,44 @@ func main() {
 	}
 
 	listenAddr := fmt.Sprintf(":%d", cfg.ListenPort)
-	listener, err := net.Listen("tcp", listenAddr)
-	if err != nil {
-		log.Fatalf("Failed to start ZoneServer: %v", err)
-	}
-	log.Printf("ZoneServer listening on %s", listenAddr)
+
+	// Init Redis Pub/Sub bus (graceful fallback if unavailable)
+	InitRedis()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
+	mux := http.NewServeMux()
+	registerHealthEndpoints(mux)
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Printf("WebSocket upgrade failed: %v", err)
+			return
+		}
+		handleClient(conn)
+	})
+
+	server := &http.Server{Addr: listenAddr, Handler: mux}
+
 	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					log.Printf("Accept error: %v", err)
-					continue
-				}
-			}
-			go handleClient(conn)
+		log.Printf("ZoneServer listening on %s (WebSocket path: /ws)", listenAddr)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Failed to start ZoneServer: %v", err)
 		}
 	}()
 
 	tickRate := time.Duration(cfg.TickRateMS) * time.Millisecond
 	ticker := time.NewTicker(tickRate)
+	presenceTicker := time.NewTicker(30 * time.Second)
 	go func() {
 		for {
 			select {
 			case <-ticker.C:
-				log.Printf("Server tick (%dms)", cfg.TickRateMS)
+				processServerTick()
+			case <-presenceTicker.C:
+				refreshRedisPresence()
 			case <-ctx.Done():
 				return
 			}
@@ -113,21 +118,23 @@ func main() {
 	<-sigChan
 	cancel()
 	ticker.Stop()
-	listener.Close()
+	presenceTicker.Stop()
+	server.Shutdown(context.Background())
 	log.Println("ZoneServer shut down cleanly")
 }
 
-func handleClient(conn net.Conn) {
+func handleClient(conn *websocket.Conn) {
 	defer conn.Close()
-	log.Printf("Client connected: %s", conn.RemoteAddr())
-	peerKey := zonePeerKey(conn.RemoteAddr().String())
+	remoteAddrStr := conn.RemoteAddr().String()
+	log.Printf("Client connected: %s", remoteAddrStr)
+	peerKey := zonePeerKey(remoteAddrStr)
 
 	session := NewSession(conn)
 	registerSession(session)
 	defer unregisterSession(session)
 
 	character := MockCharacter()
-	character.Name = fmt.Sprintf("Guest_%s", sanitizeCharacterName(conn.RemoteAddr().String()))
+	character.Name = fmt.Sprintf("Guest_%s", sanitizeCharacterName(remoteAddrStr))
 	ensureCharacterDefaults(character)
 
 	session.Character = character
@@ -143,7 +150,7 @@ func handleClient(conn net.Conn) {
 		if !session.Authenticated {
 			return
 		}
-		if err := persistCharacter(session.Character); err != nil {
+		if err := persistSessionState(session); err != nil {
 			log.Printf("Failed to persist character %s: %v", session.Character.Name, err)
 		}
 	}()
@@ -152,9 +159,6 @@ func handleClient(conn net.Conn) {
 
 	visible := make(map[*ClientSession]bool)
 
-	reader := bufio.NewScanner(conn)
-	reader.Buffer(make([]byte, 0, 4096), 1024*1024)
-
 	for session.Active {
 		if !session.Authenticated {
 			_ = conn.SetReadDeadline(time.Now().Add(authTimeout))
@@ -162,14 +166,18 @@ func handleClient(conn net.Conn) {
 			_ = conn.SetReadDeadline(time.Time{})
 		}
 
-		if !reader.Scan() {
+		_, message, err := conn.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("Client read error from %s: %v", remoteAddrStr, err)
+			}
 			break
 		}
 
 		modified := false
 
 		var msg ClientMessage
-		if err := json.Unmarshal(reader.Bytes(), &msg); err != nil {
+		if err := json.Unmarshal(message, &msg); err != nil {
 			continue
 		}
 		cmd := strings.ToUpper(msg.Command)
@@ -191,7 +199,7 @@ func handleClient(conn net.Conn) {
 		}
 
 		if modified {
-			if err := persistCharacter(session.Character); err != nil {
+			if err := persistSessionState(session); err != nil {
 				log.Printf("Failed to persist character %s: %v", session.Character.Name, err)
 			}
 		}
@@ -201,15 +209,23 @@ func handleClient(conn net.Conn) {
 		sendMessage(other.Conn, ServerMessage{Command: RespPlayerLeft, Payload: session.Character.Name})
 	}
 
-	if err := reader.Err(); err != nil {
-		if ne, ok := err.(net.Error); ok && ne.Timeout() {
-			log.Printf("Client auth timeout: %s", conn.RemoteAddr())
-		} else {
-			log.Printf("Client read error from %s: %v", conn.RemoteAddr(), err)
+	log.Printf("Client disconnected: %s", remoteAddrStr)
+}
+
+func persistSessionState(session *ClientSession) error {
+	if session == nil || session.Character == nil {
+		return nil
+	}
+	if err := persistCharacter(session.Character); err != nil {
+		return err
+	}
+	if session.Account != nil {
+		syncAccountFromCharacter(session.Account, session.Character)
+		if err := persistAccount(session.Account); err != nil {
+			return err
 		}
 	}
-
-	log.Printf("Client disconnected: %s", conn.RemoteAddr())
+	return nil
 }
 
 func toMap(v interface{}) map[string]interface{} {
@@ -258,13 +274,40 @@ func syncInitialVisibility(session *ClientSession, visible map[*ClientSession]bo
 		if isVisible(other.Position, session.Position) {
 			sendMessage(other.Conn, ServerMessage{
 				Command: RespPlayerJoined,
-				Payload: map[string]interface{}{"name": session.Character.Name, "pos": session.Position},
+				Payload: map[string]interface{}{
+					"name":   session.Character.Name,
+					"pos":    session.Position,
+					"class":  session.Character.Class,
+					"weapon": getWeaponType(session.Character),
+				},
 			})
 			sendMessage(session.Conn, ServerMessage{
 				Command: RespPlayerJoined,
-				Payload: map[string]interface{}{"name": other.Character.Name, "pos": other.Position},
+				Payload: map[string]interface{}{
+					"name":   other.Character.Name,
+					"pos":    other.Position,
+					"class":  other.Character.Class,
+					"weapon": getWeaponType(other.Character),
+				},
 			})
 			visible[other] = true
 		}
 	})
+}
+
+func getWeaponType(c *Character) string {
+	if c == nil || c.Equipped == nil {
+		return ""
+	}
+	weaponID, ok := c.Equipped[SlotWeapon]
+	if !ok {
+		return ""
+	}
+	// Find the item in inventory to get its name
+	for _, item := range c.Inventory {
+		if item.ID == weaponID {
+			return item.Name
+		}
+	}
+	return ""
 }

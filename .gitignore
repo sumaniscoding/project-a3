@@ -14,6 +14,9 @@ server/zoneserver/ZoneServer/data/characters/*.json
 server/zoneserver/ZoneServer/data/characters.db
 server/zoneserver/ZoneServer/data/characters.db-shm
 server/zoneserver/ZoneServer/data/characters.db-wal
+server/LoginServer/data/login_accounts.db
+server/LoginServer/data/login_accounts.db-shm
+server/LoginServer/data/login_accounts.db-wal
 server/zoneserver/ZoneServer/zoneserver
 server/LoginServer/loginserver
 

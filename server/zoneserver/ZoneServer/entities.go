@@ -1,6 +1,9 @@
 package main
 
-import "time"
+import (
+	"log"
+	"time"
+)
 
 func initWorldEntities() {
 	mobMu.Lock()
@@ -98,9 +101,17 @@ func attackMob(s *ClientSession, mobID, skillID string) (map[string]interface{},
 	}
 
 	if mob.HP <= 0 {
+		nearbyParty := partyNearbyMembers(s)
 		xpGain := 35 + mob.Level*4
+		partyBonusPct := minInt(len(nearbyParty)*10, 30)
+		if partyBonusPct > 0 {
+			xpGain += (xpGain * partyBonusPct) / 100
+		}
 		leveled := gainXP(s.Character, xpGain)
 		drops := rollLootForMob(s.Character, mob.ID)
+		if len(nearbyParty) > 0 {
+			drops = applyPartyLootBonus(s.Character, drops)
+		}
 		drop := maybeLegendaryDrop(s.Character)
 		if drop != nil {
 			drops = append(drops, map[string]interface{}{
@@ -115,6 +126,10 @@ func attackMob(s *ClientSession, mobID, skillID string) (map[string]interface{},
 		result["leveled_up"] = leveled
 		result["drops"] = drops
 		result["legendary"] = drop
+		result["party_bonus_pct"] = partyBonusPct
+		if len(nearbyParty) > 0 {
+			result["party_xp_shared"] = sharePartyXP(s, nearbyParty, xpGain)
+		}
 
 		respawnAfter := time.Duration(mob.RespawnSec) * time.Second
 		mob.HP = 0
@@ -139,4 +154,42 @@ func respawnMob(worldID WorldID, mobID string, wait time.Duration) {
 	mob.HP = mob.MaxHP
 	mob.Position.X += float64(randIntn(5) - 2)
 	mob.Position.Z += float64(randIntn(5) - 2)
+}
+
+func applyPartyLootBonus(c *Character, drops []map[string]interface{}) []map[string]interface{} {
+	if c == nil || len(drops) == 0 {
+		return drops
+	}
+	for _, drop := range drops {
+		if toString(drop, "kind") != lootKindMaterial {
+			continue
+		}
+		itemID := toString(drop, "item_id")
+		if itemID == "" {
+			continue
+		}
+		drop["qty"] = toInt(drop, "qty") + 1
+		c.Materials[itemID] = c.Materials[itemID] + 1
+	}
+	return drops
+}
+
+func sharePartyXP(attacker *ClientSession, nearby []*ClientSession, killerXP int) []map[string]interface{} {
+	shared := make([]map[string]interface{}, 0, len(nearby))
+	shareXP := killerXP / 2
+	if shareXP < 1 {
+		shareXP = 1
+	}
+	for _, member := range nearby {
+		leveled := gainXP(member.Character, shareXP)
+		if err := persistCharacter(member.Character); err != nil {
+			log.Printf("Failed to persist party member %s after shared XP: %v", member.Character.Name, err)
+		}
+		shared = append(shared, map[string]interface{}{
+			"name":       member.Character.Name,
+			"xp_gain":    shareXP,
+			"leveled_up": leveled,
+		})
+	}
+	return shared
 }

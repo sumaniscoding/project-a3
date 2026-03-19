@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"strconv"
+	"strings"
 )
 
 type ZoneConfig struct {
@@ -39,6 +41,11 @@ func loadZoneConfig(path string) ZoneConfig {
 	}
 	if cfg.ListenPort <= 0 {
 		cfg.ListenPort = 7777
+	}
+	if raw := strings.TrimSpace(os.Getenv("A3_LISTEN_PORT")); raw != "" {
+		if port, err := strconv.Atoi(raw); err == nil && port > 0 {
+			cfg.ListenPort = port
+		}
 	}
 
 	return cfg

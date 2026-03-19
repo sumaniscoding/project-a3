@@ -13,8 +13,10 @@ Implemented gameplay slices now include:
 - class skill trees and skill point spending
 - PvP penalty scaling by level difference with online target resolution
 - persisted character progression/state in SQLite (`data/characters.db`) with configurable persistence mode
+- Postgres-backed ZoneServer persistence when `A3_DB_BACKEND=postgres`
 - gear/pet/mercenary/element systems as combat modifiers
 - token-authenticated ZoneServer identity binding (`AUTH_TOKEN`)
+- account-backed LoginServer auth with the same configurable DB backend as ZoneServer
 
 ## Folder layout
 
@@ -45,6 +47,12 @@ Both services should use the same auth secret:
 export A3_AUTH_SECRET=\"change-me\"
 ```
 
+Browser WebSocket origins are restricted by default to loopback hosts. To allow deployed frontends explicitly:
+
+```bash
+export A3_ALLOWED_ORIGINS=\"https://game.example.com,https://admin.example.com\"
+```
+
 For production:
 
 ```bash
@@ -64,7 +72,19 @@ Persistence mode (ZoneServer):
 - default `A3_PERSISTENCE_MODE=db` (DB-only, strict)
 - `A3_PERSISTENCE_MODE=hybrid` for DB + legacy JSON fallback
 - `A3_PERSISTENCE_MODE=json` for legacy JSON-only mode
-- on DB init, legacy files in `data/characters/*.json` are auto-migrated into SQLite
+- default DB backend is SQLite for local development
+- set `A3_DB_BACKEND=postgres` and `A3_DATABASE_URL=postgres://...` to use Postgres for both LoginServer and ZoneServer
+- on DB init, legacy files in `data/characters/*.json` and `data/accounts/*.json` are auto-migrated into the configured DB backend
+
+LoginServer auth storage:
+
+- default backend is SQLite at `server/LoginServer/data/login_accounts.db`
+- when `A3_DB_BACKEND=postgres`, LoginServer stores `login_accounts` in the same Postgres database referenced by `A3_DATABASE_URL`
+
+Health/readiness endpoints:
+
+- LoginServer: `GET /healthz`, `GET /readyz`
+- ZoneServer: `GET /healthz`, `GET /readyz`
 
 ## Smoke test
 
@@ -76,11 +96,23 @@ python3 tools/smoke_test.py
 
 This sends:
 
-1. `PING` and `LOGIN` to LoginServer
-2. GDD-driven ZoneServer commands: state, NPC trust, quest accept/complete, world entry, pet/merc setup, elemental affinity, combat, and movement validation
+1. `PING`, `REGISTER`, and `LOGIN` to LoginServer
+2. ZoneServer commands covering auth, state, movement, storage, combat, persistence, and reconnect validation
 
 For real two-client PvP:
 
 ```bash
 python3 tools/pvp_duel_test.py
 ```
+
+## CI
+
+GitHub Actions backend validation is defined in:
+
+- `.github/workflows/backend.yml`
+
+It runs:
+
+1. `go test ./...` for LoginServer
+2. `go test ./...` for ZoneServer
+3. a live smoke test against LoginServer + Postgres-backed ZoneServer + Redis
