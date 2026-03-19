@@ -181,14 +181,16 @@ var skillCatalog = map[string]map[string]SkillDefinition{
 
 var worldNPCs = map[WorldID][]NPCEntity{
 	World1: {
-		{ID: "npc_elder_rowan", Name: "Elder Rowan", WorldID: World1, Position: Position{X: 108, Y: 0, Z: 106}},
-		{ID: "npc_gear_smith", Name: "Gear Smith Halan", WorldID: World1, Position: Position{X: 96, Y: 0, Z: 99}},
-		{ID: "npc_storage_keeper", Name: "Storage Keeper Lysa", WorldID: World1, Position: Position{X: 101, Y: 0, Z: 100}},
+		{ID: "npc_elder_rowan", Name: "Elder Rowan", WorldID: World1, Position: Position{X: -5, Y: 0, Z: -5}},
+		{ID: "npc_gear_smith", Name: "Gear Smith Halan", WorldID: World1, Position: Position{X: 10, Y: 0, Z: -10}},
+		{ID: "npc_storage_keeper", Name: "Storage Keeper Lysa", WorldID: World1, Position: Position{X: -10, Y: 0, Z: 5}},
+		{ID: "npc_teleporter", Name: "Planar Teleporter", WorldID: World1, Position: Position{X: 0, Y: 0, Z: 15}},
 	},
 	World2: {
-		{ID: "npc_shattered_keeper", Name: "Shattered Keeper", WorldID: World2, Position: Position{X: 507, Y: 0, Z: 502}},
+		{ID: "npc_shattered_keeper", Name: "Shattered Keeper", WorldID: World2, Position: Position{X: 0, Y: 0, Z: -10}},
+		{ID: "npc_teleporter_w2", Name: "Planar Teleporter", WorldID: World2, Position: Position{X: 0, Y: 0, Z: 15}},
 	},
 	World3: {
-		{ID: "npc_myth_warden", Name: "Myth Warden", WorldID: World3, Position: Position{X: 1007, Y: 0, Z: 1004}},
+		{ID: "npc_myth_warden", Name: "Myth Warden", WorldID: World3, Position: Position{X: 0, Y: 0, Z: 0}},
 	},
 }

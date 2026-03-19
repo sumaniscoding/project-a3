@@ -39,6 +39,43 @@ func TestActivePersistenceMode(t *testing.T) {
 	}
 }
 
+func TestActivePersistenceDBBackend(t *testing.T) {
+	t.Cleanup(resetPersistenceRuntimeStateForTests)
+
+	tests := []struct {
+		name        string
+		backendEnv  string
+		databaseURL string
+		want        string
+	}{
+		{name: "default sqlite", want: persistenceBackendSQLite},
+		{name: "database url implies postgres", databaseURL: "postgres://example", want: persistenceBackendPostgres},
+		{name: "explicit postgres", backendEnv: "postgres", want: persistenceBackendPostgres},
+		{name: "postgres alias", backendEnv: "postgresql", want: persistenceBackendPostgres},
+		{name: "explicit sqlite", backendEnv: "sqlite", databaseURL: "postgres://example", want: persistenceBackendSQLite},
+		{name: "unknown defaults sqlite", backendEnv: "bogus", want: persistenceBackendSQLite},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resetPersistenceRuntimeStateForTests()
+			if tc.backendEnv == "" {
+				_ = os.Unsetenv("A3_DB_BACKEND")
+			} else {
+				_ = os.Setenv("A3_DB_BACKEND", tc.backendEnv)
+			}
+			if tc.databaseURL == "" {
+				_ = os.Unsetenv("A3_DATABASE_URL")
+			} else {
+				_ = os.Setenv("A3_DATABASE_URL", tc.databaseURL)
+			}
+			if got := activePersistenceDBBackend(); got != tc.want {
+				t.Fatalf("backend=%q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestDBModeMigratesLegacyCharacter(t *testing.T) {
 	t.Cleanup(resetPersistenceRuntimeStateForTests)
 	resetPersistenceRuntimeStateForTests()

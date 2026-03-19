@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
 import json
+import os
 import socket
 import time
+import websocket
 
 
 class JsonConn:
     def __init__(self, host, port):
-        self.sock = socket.create_connection((host, port), timeout=3)
-        self.file = self.sock.makefile("r", encoding="utf-8", newline="\n")
+        self.sock = websocket.create_connection(f"ws://{host}:{port}/ws", timeout=3)
 
     def send(self, obj):
-        self.sock.sendall((json.dumps(obj) + "\n").encode("utf-8"))
+        self.sock.send(json.dumps(obj))
 
     def recv_until(self, expected_command, timeout=5.0):
         deadline = time.time() + timeout
         while time.time() < deadline:
             self.sock.settimeout(max(0.1, deadline - time.time()))
-            line = self.file.readline()
+            try:
+                line = self.sock.recv()
+            except websocket.WebSocketTimeoutException:
+                continue
+            except Exception as e:
+                print(f"[raw] recv error:", e)
+                continue
             if not line:
                 continue
             line = line.strip()
@@ -29,10 +36,13 @@ class JsonConn:
         raise TimeoutError(f"timed out waiting for {expected_command}")
 
     def close(self):
-        try:
-            self.file.close()
-        finally:
-            self.sock.close()
+        self.sock.close()
+
+
+ZONE_HOST = os.getenv("A3_ZONE_HOST", "127.0.0.1")
+ZONE_PORT_A = int(os.getenv("A3_ZONE_PORT_A", "7777"))
+ZONE_PORT_B = int(os.getenv("A3_ZONE_PORT_B", str(ZONE_PORT_A)))
+LOGIN_URL = os.getenv("A3_LOGIN_URL", "ws://127.0.0.1:5555/ws")
 
 
 def expect_payload(msg, expected, label):
@@ -50,16 +60,31 @@ def auth(conn, name):
 
 
 def login_token(username):
-    with socket.create_connection(("127.0.0.1", 5555), timeout=3) as sock:
-        sock.sendall((json.dumps({"command": "LOGIN", "username": username, "password": "demo"}) + "\n").encode("utf-8"))
-        line = b""
-        while not line.endswith(b"\n"):
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            line += chunk
-    msg = json.loads(line.decode("utf-8").strip())
+    sock = websocket.create_connection(LOGIN_URL, timeout=3)
+    try:
+        password = "demo-pass"
+        sock.send(json.dumps({"command": "REGISTER", "username": username, "password": password}))
+        register_msg = recv_until(sock, {"REGISTER_OK", "REGISTER_DENIED"})
+        if register_msg.get("command") == "REGISTER_DENIED" and register_msg.get("payload") != "ACCOUNT_EXISTS":
+            raise RuntimeError(f"unexpected register response: {register_msg!r}")
+        sock.send(json.dumps({"command": "LOGIN", "username": username, "password": password}))
+        msg = recv_until(sock, {"LOGIN_OK"})
+    finally:
+        sock.close()
     return msg["payload"]["token"]
+
+
+def recv_until(sock, expected_commands, timeout=5.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        sock.settimeout(max(0.1, deadline - time.time()))
+        line = sock.recv()
+        if not line:
+            continue
+        msg = json.loads(line)
+        if msg.get("command") in expected_commands:
+            return msg
+    raise TimeoutError(f"timed out waiting for {expected_commands}")
 
 
 def main():
@@ -67,17 +92,17 @@ def main():
     name_a = f"DuelA_{run_id}"
     name_b = f"DuelB_{run_id}"
 
-    a = JsonConn("127.0.0.1", 7777)
-    b = JsonConn("127.0.0.1", 7777)
+    a = JsonConn(ZONE_HOST, ZONE_PORT_A)
+    b = JsonConn(ZONE_HOST, ZONE_PORT_B)
 
     try:
         auth(a, name_a)
         auth(b, name_b)
 
-        a.send({"command": "MOVE", "payload": {"x": 102.0, "y": 0.0, "z": 102.0}})
+        a.send({"command": "MOVE", "payload": {"x": 7.0, "y": 0.0, "z": 7.0}})
         a.recv_until("MOVE_OK")
 
-        b.send({"command": "MOVE", "payload": {"x": 103.0, "y": 0.0, "z": 103.0}})
+        b.send({"command": "MOVE", "payload": {"x": 6.0, "y": 0.0, "z": 6.0}})
         b.recv_until("MOVE_OK")
 
         a.send({"command": "SET_PRESENCE", "payload": {"status": "online"}})

@@ -58,7 +58,9 @@ func MockCharacter() *Character {
 		},
 		Trust:    make(map[string]int),
 		Quests:   make(map[string]*QuestProgress),
-		Equipped: make(map[string]string),
+		Equipped: map[string]string{
+			SlotWeapon: "starter_bow",
+		},
 		Pet: PetState{
 			Name:     "Falcon",
 			Passive:  "Critical Focus",

@@ -1,0 +1,100 @@
+name: Backend
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: projecta3_zone
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d projecta3_zone"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.0"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Smoke Test Dependency
+        run: python3 -m pip install websocket-client
+
+      - name: Test LoginServer
+        working-directory: server/LoginServer
+        run: go test ./...
+
+      - name: Test ZoneServer
+        working-directory: server/zoneserver/ZoneServer
+        run: go test ./...
+
+      - name: Run Smoke Test
+        working-directory: .
+        env:
+          A3_DB_BACKEND: postgres
+          A3_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/projecta3_zone?sslmode=disable
+          A3_REDIS_ADDR: 127.0.0.1:6379
+        run: |
+          set -euo pipefail
+
+          cleanup() {
+            local exit_code=$?
+            if [[ "${exit_code}" -ne 0 && -f /tmp/loginserver.log ]]; then
+              echo "== LoginServer log =="
+              cat /tmp/loginserver.log
+            fi
+            if [[ "${exit_code}" -ne 0 && -f /tmp/zoneserver.log ]]; then
+              echo "== ZoneServer log =="
+              cat /tmp/zoneserver.log
+            fi
+            jobs -p | xargs -r kill || true
+            wait || true
+            exit "${exit_code}"
+          }
+          trap cleanup EXIT
+
+          (
+            cd server/LoginServer
+            go run . > /tmp/loginserver.log 2>&1
+          ) &
+
+          (
+            cd server/zoneserver/ZoneServer
+            go run . > /tmp/zoneserver.log 2>&1
+          ) &
+
+          timeout 60 bash -c 'until curl -fsS http://127.0.0.1:5555/readyz >/dev/null; do sleep 1; done'
+          timeout 60 bash -c 'until curl -fsS http://127.0.0.1:7777/readyz >/dev/null; do sleep 1; done'
+
+          python3 tools/smoke_test.py

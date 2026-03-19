@@ -269,9 +269,6 @@ func equipMercItem(c *Character, itemID string) (map[string]interface{}, bool, s
 	if c.Mercenary.Equipped == nil {
 		c.Mercenary.Equipped = map[string]string{}
 	}
-	if c.Equipped[item.Slot] == item.ID {
-		return nil, false, "ITEM_ALREADY_EQUIPPED_BY_PLAYER"
-	}
 	c.Mercenary.Equipped[item.Slot] = item.ID
 	return map[string]interface{}{
 		"event":     "EQUIPPED",

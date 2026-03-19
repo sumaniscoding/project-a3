@@ -1,11 +1,7 @@
 package main
 
 import (
-	"bufio"
-	"encoding/json"
-	"net"
 	"testing"
-	"time"
 )
 
 func resetSocialStateForTests() {
@@ -955,37 +951,23 @@ func TestPresenceStatusParsing(t *testing.T) {
 	}
 }
 
-func readServerMessage(conn net.Conn) (ServerMessage, error) {
-	_ = conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-	line, err := bufio.NewReader(conn).ReadString('\n')
-	if err != nil {
-		return ServerMessage{}, err
-	}
-	var msg ServerMessage
-	if err := json.Unmarshal([]byte(line), &msg); err != nil {
-		return ServerMessage{}, err
-	}
-	return msg, nil
-}
-
+// TestBroadcastWhisper exercises the whisper flow using captureConn stubs.
+// broadcastWhisper now routes through the Redis bus (or local fallback), so
+// we verify the message via DrainMessages instead of a raw net.Pipe reader.
 func TestBroadcastWhisper(t *testing.T) {
 	resetSessionStateForTests()
 
-	aliceWrite, aliceRead := net.Pipe()
-	bobWrite, bobRead := net.Pipe()
-	defer aliceWrite.Close()
-	defer aliceRead.Close()
-	defer bobWrite.Close()
-	defer bobRead.Close()
+	aliceConn := &captureConn{}
+	bobConn := &captureConn{}
 
 	alice := &ClientSession{
-		Conn:          aliceWrite,
+		Conn:          aliceConn,
 		Authenticated: true,
 		Character:     &Character{Name: "Alice"},
 		Active:        true,
 	}
 	bob := &ClientSession{
-		Conn:          bobWrite,
+		Conn:          bobConn,
 		Authenticated: true,
 		Character:     &Character{Name: "Bob"},
 		Active:        true,
@@ -995,38 +977,23 @@ func TestBroadcastWhisper(t *testing.T) {
 	bindSessionCharacterName(alice, "Alice")
 	bindSessionCharacterName(bob, "Bob")
 
-	type whisperRead struct {
-		msg ServerMessage
-		err error
-	}
-	aliceMsgCh := make(chan whisperRead, 1)
-	bobMsgCh := make(chan whisperRead, 1)
-	go func() {
-		msg, err := readServerMessage(aliceRead)
-		aliceMsgCh <- whisperRead{msg: msg, err: err}
-	}()
-	go func() {
-		msg, err := readServerMessage(bobRead)
-		bobMsgCh <- whisperRead{msg: msg, err: err}
-	}()
-
 	ok, reason := broadcastWhisper(alice, "Bob", "psst")
 	if !ok || reason != "OK" {
 		t.Fatalf("expected whisper success, got ok=%v reason=%s", ok, reason)
 	}
 
-	aliceReadRes := <-aliceMsgCh
-	bobReadRes := <-bobMsgCh
-	if aliceReadRes.err != nil || bobReadRes.err != nil {
-		t.Fatalf("failed reading whisper messages: alice=%v bob=%v", aliceReadRes.err, bobReadRes.err)
+	// The local bus delivers synchronously when Redis is not configured.
+	aliceMsgs := aliceConn.DrainMessages(t)
+	bobMsgs := bobConn.DrainMessages(t)
+
+	if len(aliceMsgs) == 0 || aliceMsgs[0].Command != RespChatMessage {
+		t.Fatalf("expected CHAT_MESSAGE for alice, got %#v", aliceMsgs)
 	}
-	aliceMsg := aliceReadRes.msg
-	bobMsg := bobReadRes.msg
-	if aliceMsg.Command != RespChatMessage || bobMsg.Command != RespChatMessage {
-		t.Fatalf("expected CHAT_MESSAGE on both sides")
+	if len(bobMsgs) == 0 || bobMsgs[0].Command != RespChatMessage {
+		t.Fatalf("expected CHAT_MESSAGE for bob, got %#v", bobMsgs)
 	}
-	alicePayload := toMap(aliceMsg.Payload)
-	bobPayload := toMap(bobMsg.Payload)
+	alicePayload := toMap(aliceMsgs[0].Payload)
+	bobPayload := toMap(bobMsgs[0].Payload)
 	if toString(alicePayload, "channel") != "whisper" || toString(bobPayload, "channel") != "whisper" {
 		t.Fatalf("expected whisper channel payload")
 	}
@@ -1038,12 +1005,8 @@ func TestBroadcastWhisper(t *testing.T) {
 func TestBroadcastWhisperRejectsOfflineTarget(t *testing.T) {
 	resetSessionStateForTests()
 
-	aliceWrite, aliceRead := net.Pipe()
-	defer aliceWrite.Close()
-	defer aliceRead.Close()
-
 	alice := &ClientSession{
-		Conn:          aliceWrite,
+		Conn:          &captureConn{},
 		Authenticated: true,
 		Character:     &Character{Name: "Alice"},
 		Active:        true,
@@ -1133,21 +1096,14 @@ func TestFriendRequestRejectedWhenBlocked(t *testing.T) {
 func TestBroadcastWhisperBlocked(t *testing.T) {
 	resetSessionStateForTests()
 
-	aliceWrite, aliceRead := net.Pipe()
-	bobWrite, bobRead := net.Pipe()
-	defer aliceWrite.Close()
-	defer aliceRead.Close()
-	defer bobWrite.Close()
-	defer bobRead.Close()
-
 	alice := &ClientSession{
-		Conn:          aliceWrite,
+		Conn:          &captureConn{},
 		Authenticated: true,
 		Character:     &Character{Name: "Alice", Blocks: map[string]bool{"Bob": true}},
 		Active:        true,
 	}
 	bob := &ClientSession{
-		Conn:          bobWrite,
+		Conn:          &captureConn{},
 		Authenticated: true,
 		Character:     &Character{Name: "Bob", Blocks: map[string]bool{}},
 		Active:        true,

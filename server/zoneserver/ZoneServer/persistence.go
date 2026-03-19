@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
 )
 
@@ -26,10 +27,18 @@ const (
 	persistenceJSON   = "json"
 )
 
+const (
+	persistenceBackendSQLite   = "sqlite"
+	persistenceBackendPostgres = "postgres"
+)
+
 var (
 	characterDBOnce sync.Once
 	characterDBConn *sql.DB
 	characterDBErr  error
+
+	persistenceBackendOnce sync.Once
+	persistenceBackend     string
 
 	persistenceModeOnce sync.Once
 	persistenceMode     string
@@ -42,6 +51,8 @@ func resetPersistenceRuntimeStateForTests() {
 	characterDBConn = nil
 	characterDBErr = nil
 	characterDBOnce = sync.Once{}
+	persistenceBackend = ""
+	persistenceBackendOnce = sync.Once{}
 	persistenceMode = ""
 	persistenceModeOnce = sync.Once{}
 }
@@ -99,6 +110,49 @@ func loadCharacter(name, class string) (*Character, error) {
 	}
 
 	return nil, fmt.Errorf("unknown persistence mode %q", mode)
+}
+
+func loadExistingCharacter(name string) (*Character, bool, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, false, nil
+	}
+
+	mode := activePersistenceMode()
+	safeName := sanitizeCharacterName(name)
+	switch mode {
+	case persistenceJSON:
+		return loadCharacterFromLegacy(name, "")
+	case persistenceDB, persistenceHybrid:
+		db, err := openCharacterDB()
+		if err != nil {
+			if mode == persistenceHybrid {
+				return loadCharacterFromLegacy(name, "")
+			}
+			return nil, false, fmt.Errorf("character db unavailable in db mode: %w", err)
+		}
+
+		c, found, loadErr := loadCharacterFromDB(db, safeName, name, "")
+		if loadErr == nil {
+			return c, found, nil
+		}
+		if mode != persistenceHybrid {
+			return nil, false, loadErr
+		}
+
+		legacy, found, legacyErr := loadCharacterFromLegacy(name, "")
+		if legacyErr != nil {
+			return nil, false, legacyErr
+		}
+		if found {
+			if persistErr := persistCharacterToDB(db, legacy); persistErr != nil {
+				log.Printf("Character migration to DB failed for %q: %v", name, persistErr)
+			}
+		}
+		return legacy, found, nil
+	default:
+		return nil, false, fmt.Errorf("unknown persistence mode %q", mode)
+	}
 }
 
 func persistCharacter(c *Character) error {
@@ -224,37 +278,39 @@ func persistAccount(a *Account) error {
 
 func openCharacterDB() (*sql.DB, error) {
 	characterDBOnce.Do(func() {
-		if err := os.MkdirAll(filepath.Dir(characterDBPath), 0o755); err != nil {
-			characterDBErr = err
-			return
-		}
-
-		db, err := sql.Open("sqlite", characterDBPath)
+		backend := activePersistenceDBBackend()
+		driverName, dataSourceName, err := persistenceDriverConfig(backend)
 		if err != nil {
 			characterDBErr = err
 			return
 		}
-		db.SetMaxOpenConns(1)
 
-		schema := `
-CREATE TABLE IF NOT EXISTS characters (
-  name TEXT PRIMARY KEY,
-  payload TEXT NOT NULL,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS accounts (
-  username TEXT PRIMARY KEY,
-  payload TEXT NOT NULL,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);`
-		if _, err := db.Exec(schema); err != nil {
+		db, err := sql.Open(driverName, dataSourceName)
+		if err != nil {
+			characterDBErr = err
+			return
+		}
+		applyPersistenceConnectionPool(db, backend)
+
+		for _, stmt := range persistenceSchemaStatements(backend) {
+			if _, err := db.Exec(stmt); err != nil {
+				_ = db.Close()
+				characterDBErr = err
+				return
+			}
+		}
+		if err := db.Ping(); err != nil {
 			_ = db.Close()
 			characterDBErr = err
 			return
 		}
 
-		// One-time migration from legacy JSON files into SQLite.
 		if err := migrateLegacyCharactersToDB(db); err != nil {
+			_ = db.Close()
+			characterDBErr = err
+			return
+		}
+		if err := migrateLegacyAccountsToDB(db); err != nil {
 			_ = db.Close()
 			characterDBErr = err
 			return
@@ -263,6 +319,96 @@ CREATE TABLE IF NOT EXISTS accounts (
 		characterDBConn = db
 	})
 	return characterDBConn, characterDBErr
+}
+
+func activePersistenceDBBackend() string {
+	persistenceBackendOnce.Do(func() {
+		raw := strings.ToLower(strings.TrimSpace(os.Getenv("A3_DB_BACKEND")))
+		switch raw {
+		case "":
+			if strings.TrimSpace(os.Getenv("A3_DATABASE_URL")) != "" {
+				persistenceBackend = persistenceBackendPostgres
+			} else {
+				persistenceBackend = persistenceBackendSQLite
+			}
+		case persistenceBackendPostgres, "pg", "postgresql":
+			persistenceBackend = persistenceBackendPostgres
+		case persistenceBackendSQLite:
+			persistenceBackend = persistenceBackendSQLite
+		default:
+			log.Printf("Unknown A3_DB_BACKEND=%q, defaulting to sqlite", raw)
+			persistenceBackend = persistenceBackendSQLite
+		}
+		log.Printf("Persistence DB backend: %s", persistenceBackend)
+	})
+	return persistenceBackend
+}
+
+func persistenceDriverConfig(backend string) (string, string, error) {
+	switch backend {
+	case persistenceBackendPostgres:
+		dsn := strings.TrimSpace(os.Getenv("A3_DATABASE_URL"))
+		if dsn == "" {
+			return "", "", fmt.Errorf("A3_DATABASE_URL is required when A3_DB_BACKEND=postgres")
+		}
+		return "pgx", dsn, nil
+	case persistenceBackendSQLite:
+		dbPath := strings.TrimSpace(os.Getenv("A3_SQLITE_PATH"))
+		if dbPath == "" {
+			dbPath = characterDBPath
+		}
+		if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+			return "", "", err
+		}
+		return "sqlite", dbPath, nil
+	default:
+		return "", "", fmt.Errorf("unsupported persistence backend %q", backend)
+	}
+}
+
+func applyPersistenceConnectionPool(db *sql.DB, backend string) {
+	switch backend {
+	case persistenceBackendPostgres:
+		db.SetMaxOpenConns(10)
+		db.SetMaxIdleConns(5)
+	default:
+		db.SetMaxOpenConns(1)
+		db.SetMaxIdleConns(1)
+	}
+}
+
+func persistenceSchemaStatements(backend string) []string {
+	switch backend {
+	case persistenceBackendPostgres:
+		return []string{
+			`CREATE TABLE IF NOT EXISTS characters (
+			  name TEXT PRIMARY KEY,
+			  payload TEXT NOT NULL,
+			  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+			)`,
+			`CREATE TABLE IF NOT EXISTS accounts (
+			  username TEXT PRIMARY KEY,
+			  payload TEXT NOT NULL,
+			  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+			)`,
+		}
+	default:
+		return []string{
+			`PRAGMA journal_mode=WAL;`,
+			`PRAGMA synchronous=NORMAL;`,
+			`PRAGMA busy_timeout=5000;`,
+			`CREATE TABLE IF NOT EXISTS characters (
+			  name TEXT PRIMARY KEY,
+			  payload TEXT NOT NULL,
+			  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+			)`,
+			`CREATE TABLE IF NOT EXISTS accounts (
+			  username TEXT PRIMARY KEY,
+			  payload TEXT NOT NULL,
+			  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+			)`,
+		}
+	}
 }
 
 func migrateLegacyCharactersToDB(db *sql.DB) error {
@@ -301,9 +447,45 @@ func migrateLegacyCharactersToDB(db *sql.DB) error {
 	return nil
 }
 
+func migrateLegacyAccountsToDB(db *sql.DB) error {
+	entries, err := os.ReadDir(accountStoreDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".json") {
+			continue
+		}
+		rawName := strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
+		path := filepath.Join(accountStoreDir, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+
+		var a Account
+		if err := json.Unmarshal(data, &a); err != nil {
+			return err
+		}
+
+		if strings.TrimSpace(a.Username) == "" {
+			a.Username = rawName
+		}
+		ensureAccountDefaults(&a)
+		if err := persistAccountToDB(db, &a); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func loadCharacterFromDB(db *sql.DB, safeName, inputName, class string) (*Character, bool, error) {
 	var payload string
-	err := db.QueryRow(`SELECT payload FROM characters WHERE name = ?`, safeName).Scan(&payload)
+	err := db.QueryRow(characterSelectQuery(), safeName).Scan(&payload)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, false, nil
@@ -334,11 +516,7 @@ func persistCharacterToDB(db *sql.DB, c *Character) error {
 		return err
 	}
 	_, err = db.Exec(
-		`INSERT INTO characters(name, payload, updated_at)
-		 VALUES(?, ?, CURRENT_TIMESTAMP)
-		 ON CONFLICT(name) DO UPDATE SET
-		   payload=excluded.payload,
-		   updated_at=CURRENT_TIMESTAMP`,
+		characterUpsertQuery(),
 		sanitizeCharacterName(c.Name),
 		string(payload),
 	)
@@ -347,7 +525,7 @@ func persistCharacterToDB(db *sql.DB, c *Character) error {
 
 func loadAccountFromDB(db *sql.DB, safeUser, inputUser string) (*Account, bool, error) {
 	var payload string
-	err := db.QueryRow(`SELECT payload FROM accounts WHERE username = ?`, safeUser).Scan(&payload)
+	err := db.QueryRow(accountSelectQuery(), safeUser).Scan(&payload)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, false, nil
@@ -370,15 +548,55 @@ func persistAccountToDB(db *sql.DB, a *Account) error {
 		return err
 	}
 	_, err = db.Exec(
-		`INSERT INTO accounts(username, payload, updated_at)
-		 VALUES(?, ?, CURRENT_TIMESTAMP)
-		 ON CONFLICT(username) DO UPDATE SET
-		   payload=excluded.payload,
-		   updated_at=CURRENT_TIMESTAMP`,
+		accountUpsertQuery(),
 		sanitizeCharacterName(a.Username),
 		string(payload),
 	)
 	return err
+}
+
+func characterSelectQuery() string {
+	if activePersistenceDBBackend() == persistenceBackendPostgres {
+		return `SELECT payload FROM characters WHERE name = $1`
+	}
+	return `SELECT payload FROM characters WHERE name = ?`
+}
+
+func accountSelectQuery() string {
+	if activePersistenceDBBackend() == persistenceBackendPostgres {
+		return `SELECT payload FROM accounts WHERE username = $1`
+	}
+	return `SELECT payload FROM accounts WHERE username = ?`
+}
+
+func characterUpsertQuery() string {
+	if activePersistenceDBBackend() == persistenceBackendPostgres {
+		return `INSERT INTO characters(name, payload, updated_at)
+		 VALUES($1, $2, NOW())
+		 ON CONFLICT(name) DO UPDATE SET
+		   payload=EXCLUDED.payload,
+		   updated_at=NOW()`
+	}
+	return `INSERT INTO characters(name, payload, updated_at)
+		 VALUES(?, ?, CURRENT_TIMESTAMP)
+		 ON CONFLICT(name) DO UPDATE SET
+		   payload=excluded.payload,
+		   updated_at=CURRENT_TIMESTAMP`
+}
+
+func accountUpsertQuery() string {
+	if activePersistenceDBBackend() == persistenceBackendPostgres {
+		return `INSERT INTO accounts(username, payload, updated_at)
+		 VALUES($1, $2, NOW())
+		 ON CONFLICT(username) DO UPDATE SET
+		   payload=EXCLUDED.payload,
+		   updated_at=NOW()`
+	}
+	return `INSERT INTO accounts(username, payload, updated_at)
+		 VALUES(?, ?, CURRENT_TIMESTAMP)
+		 ON CONFLICT(username) DO UPDATE SET
+		   payload=excluded.payload,
+		   updated_at=CURRENT_TIMESTAMP`
 }
 
 func loadCharacterFromLegacy(name, class string) (*Character, bool, error) {

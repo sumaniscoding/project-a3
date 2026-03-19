@@ -95,49 +95,25 @@ func canonicalPresenceStatus(raw string) string {
 }
 
 func broadcastSay(session *ClientSession, message string) {
-	payload := map[string]interface{}{
-		"channel": "say",
-		"from":    session.Character.Name,
-		"world":   session.World.Name,
-		"message": message,
-		"ts":      time.Now().UTC().Format(time.RFC3339),
-	}
-	forEachSession(func(other *ClientSession) {
-		if !other.Authenticated || other.Character == nil || other.World == nil {
-			return
-		}
-		if other.World.ID != session.World.ID {
-			return
-		}
-		if other != session && !chatDeliveryAllowed(session, other) {
-			return
-		}
-		if other != session && !isVisible(session.Position, other.Position) {
-			return
-		}
-		sendMessage(other.Conn, ServerMessage{Command: RespChatMessage, Payload: payload})
+	PublishRedisEvent(EvtChatSay, ChatSayPayload{
+		From:    session.Character.Name,
+		WorldID: int(session.World.ID),
+		World:   session.World.Name,
+		Message: message,
+		Ts:      time.Now().UTC().Format(time.RFC3339),
+		X:       session.Position.X,
+		Y:       session.Position.Y,
+		Z:       session.Position.Z,
 	})
 }
 
 func broadcastWorld(session *ClientSession, message string) {
-	payload := map[string]interface{}{
-		"channel": "world",
-		"from":    session.Character.Name,
-		"world":   session.World.Name,
-		"message": message,
-		"ts":      time.Now().UTC().Format(time.RFC3339),
-	}
-	forEachSession(func(other *ClientSession) {
-		if !other.Authenticated || other.Character == nil || other.World == nil {
-			return
-		}
-		if other.World.ID != session.World.ID {
-			return
-		}
-		if other != session && !chatDeliveryAllowed(session, other) {
-			return
-		}
-		sendMessage(other.Conn, ServerMessage{Command: RespChatMessage, Payload: payload})
+	PublishRedisEvent(EvtChatWorld, ChatWorldPayload{
+		From:    session.Character.Name,
+		WorldID: int(session.World.ID),
+		World:   session.World.Name,
+		Message: message,
+		Ts:      time.Now().UTC().Format(time.RFC3339),
 	})
 }
 
@@ -153,26 +129,22 @@ func broadcastWhisper(session *ClientSession, targetName, message string) (bool,
 		return false, "INVALID_TARGET"
 	}
 
-	target := findSessionByCharacterName(targetName)
-	if target == nil || !target.Authenticated || target.Character == nil {
+	if !isCharacterOnlineAnywhere(targetName) {
 		return false, "TARGET_OFFLINE"
 	}
-	if isBlocked(target.Character.Name, session.Character.Name) {
+	if isBlocked(targetName, session.Character.Name) {
 		return false, "TARGET_BLOCKED_YOU"
 	}
-	if isBlocked(session.Character.Name, target.Character.Name) {
+	if isBlocked(session.Character.Name, targetName) {
 		return false, "TARGET_BLOCKED_BY_YOU"
 	}
 
-	payload := map[string]interface{}{
-		"channel": "whisper",
-		"from":    session.Character.Name,
-		"to":      target.Character.Name,
-		"message": message,
-		"ts":      time.Now().UTC().Format(time.RFC3339),
-	}
-	sendMessage(target.Conn, ServerMessage{Command: RespChatMessage, Payload: payload})
-	sendMessage(session.Conn, ServerMessage{Command: RespChatMessage, Payload: payload})
+	PublishRedisEvent(EvtChatWhisper, ChatWhisperPayload{
+		From:    session.Character.Name,
+		To:      targetName,
+		Message: message,
+		Ts:      time.Now().UTC().Format(time.RFC3339),
+	})
 	return true, "OK"
 }
 
@@ -181,25 +153,12 @@ func broadcastGuild(session *ClientSession, message string) bool {
 	if guild == "" {
 		return false
 	}
-
-	payload := map[string]interface{}{
-		"channel": "guild",
-		"from":    session.Character.Name,
-		"guild":   guild,
-		"message": message,
-		"ts":      time.Now().UTC().Format(time.RFC3339),
-	}
-	recipients := guildMemberNames(guild)
-	for _, name := range recipients {
-		other := findSessionByCharacterName(name)
-		if other == nil || !other.Authenticated || other.Character == nil {
-			continue
-		}
-		if other != session && !chatDeliveryAllowed(session, other) {
-			continue
-		}
-		sendMessage(other.Conn, ServerMessage{Command: RespChatMessage, Payload: payload})
-	}
+	PublishRedisEvent(EvtChatGuild, ChatGuildPayload{
+		From:    session.Character.Name,
+		Guild:   guild,
+		Message: message,
+		Ts:      time.Now().UTC().Format(time.RFC3339),
+	})
 	return true
 }
 
@@ -275,13 +234,20 @@ func isBlocked(blocker, target string) bool {
 		return false
 	}
 	blockerSession := findSessionByCharacterName(blocker)
-	if blockerSession == nil || blockerSession.Character == nil {
+	if blockerSession != nil && blockerSession.Character != nil {
+		if blockerSession.Character.Blocks == nil {
+			blockerSession.Character.Blocks = map[string]bool{}
+		}
+		return blockerSession.Character.Blocks[target]
+	}
+	blockerCharacter, found, err := loadExistingCharacter(blocker)
+	if err != nil || !found || blockerCharacter == nil {
 		return false
 	}
-	if blockerSession.Character.Blocks == nil {
-		blockerSession.Character.Blocks = map[string]bool{}
+	if blockerCharacter.Blocks == nil {
+		blockerCharacter.Blocks = map[string]bool{}
 	}
-	return blockerSession.Character.Blocks[target]
+	return blockerCharacter.Blocks[target]
 }
 
 func friendListPayload(c *Character) map[string]interface{} {
@@ -646,10 +612,16 @@ func partyInvite(inviter, target string) (map[string]interface{}, bool, string) 
 			return nil, false, "NOT_PARTY_LEADER"
 		}
 	}
-	partyInvites[target] = PartyInvite{
+	invite := PartyInvite{
 		From:      inviter,
 		ExpiresAt: time.Now().UTC().Add(partyInviteTTL),
 	}
+	partyInvites[target] = invite
+	BroadcastSocialSync(SocialSyncPayload{
+		Action:      "PARTY_INVITE_SET",
+		Target:      target,
+		PartyInvite: &invite,
+	})
 	return map[string]interface{}{"from": inviter, "to": target}, true, "OK"
 }
 
@@ -663,6 +635,7 @@ func partyAccept(target, from string) (map[string]interface{}, bool, string) {
 	}
 	if time.Now().UTC().After(invite.ExpiresAt) {
 		delete(partyInvites, target)
+		BroadcastSocialSync(SocialSyncPayload{Action: "PARTY_INVITE_CLEAR", Target: target})
 		return nil, false, "INVITE_EXPIRED"
 	}
 	inviter := invite.From
@@ -671,6 +644,7 @@ func partyAccept(target, from string) (map[string]interface{}, bool, string) {
 	}
 	if isBlocked(inviter, target) || isBlocked(target, inviter) {
 		delete(partyInvites, target)
+		BroadcastSocialSync(SocialSyncPayload{Action: "PARTY_INVITE_CLEAR", Target: target})
 		return nil, false, "BLOCKED"
 	}
 	if _, inParty := partyByMember[target]; inParty {
@@ -701,7 +675,15 @@ func partyAccept(target, from string) (map[string]interface{}, bool, string) {
 	p.Ready[target] = false
 	partyByMember[target] = pid
 	delete(partyInvites, target)
-	return map[string]interface{}{"party": partySnapshotLocked(p)}, true, "OK"
+	BroadcastSocialSync(SocialSyncPayload{Action: "PARTY_INVITE_CLEAR", Target: target})
+
+	snap := partySnapshotLocked(p)
+	BroadcastSocialSync(SocialSyncPayload{
+		Action: "PARTY_UPDATE",
+		Party:  p,
+	})
+
+	return map[string]interface{}{"party": snap}, true, "OK"
 }
 
 func partyCancelInvite(inviter, target string) (map[string]interface{}, bool, string) {
@@ -723,12 +705,14 @@ func partyCancelInvite(inviter, target string) (map[string]interface{}, bool, st
 	}
 	if time.Now().UTC().After(invite.ExpiresAt) {
 		delete(partyInvites, target)
+		BroadcastSocialSync(SocialSyncPayload{Action: "PARTY_INVITE_CLEAR", Target: target})
 		return nil, false, "INVITE_EXPIRED"
 	}
 	if invite.From != inviter {
 		return nil, false, "NOT_INVITER"
 	}
 	delete(partyInvites, target)
+	BroadcastSocialSync(SocialSyncPayload{Action: "PARTY_INVITE_CLEAR", Target: target})
 	return map[string]interface{}{
 		"from": inviter,
 		"to":   target,
@@ -751,12 +735,14 @@ func partyDecline(target, from string) (map[string]interface{}, bool, string) {
 	}
 	if time.Now().UTC().After(invite.ExpiresAt) {
 		delete(partyInvites, target)
+		BroadcastSocialSync(SocialSyncPayload{Action: "PARTY_INVITE_CLEAR", Target: target})
 		return nil, false, "INVITE_EXPIRED"
 	}
 	if from != "" && invite.From != from {
 		return nil, false, "INVITE_MISMATCH"
 	}
 	delete(partyInvites, target)
+	BroadcastSocialSync(SocialSyncPayload{Action: "PARTY_INVITE_CLEAR", Target: target})
 	return map[string]interface{}{
 		"from": invite.From,
 		"to":   target,
@@ -792,16 +778,31 @@ func partyKick(leader, target string) (map[string]interface{}, bool, string) {
 	delete(p.Members, target)
 	delete(p.Ready, target)
 	delete(partyByMember, target)
+
 	if len(p.Members) < 2 {
 		remaining := sortedMembersLocked(p.Members)
 		for name := range p.Members {
 			delete(partyByMember, name)
 		}
 		delete(parties, p.ID)
+
+		BroadcastSocialSync(SocialSyncPayload{
+			Action:   "PARTY_DISBAND",
+			Party:    p,
+			Removals: append(remaining, target),
+		})
+
 		return map[string]interface{}{"party_id": pid, "target": target, "dissolved": true, "remaining": remaining}, true, "OK"
 	}
 
-	return map[string]interface{}{"party": partySnapshotLocked(p), "target": target, "dissolved": false}, true, "OK"
+	snap := partySnapshotLocked(p)
+	BroadcastSocialSync(SocialSyncPayload{
+		Action:   "PARTY_UPDATE",
+		Party:    p,
+		Removals: []string{target},
+	})
+
+	return map[string]interface{}{"party": snap, "target": target, "dissolved": false}, true, "OK"
 }
 
 func partyTransferLeader(actor, target string) (map[string]interface{}, bool, string) {
@@ -833,8 +834,15 @@ func partyTransferLeader(actor, target string) (map[string]interface{}, bool, st
 	}
 
 	p.Leader = target
+
+	snap := partySnapshotLocked(p)
+	BroadcastSocialSync(SocialSyncPayload{
+		Action: "PARTY_UPDATE",
+		Party:  p,
+	})
+
 	return map[string]interface{}{
-		"party":      partySnapshotLocked(p),
+		"party":      snap,
 		"from":       actor,
 		"to":         target,
 		"new_leader": target,
@@ -867,6 +875,13 @@ func partyDisband(leader string) (map[string]interface{}, bool, string) {
 		delete(partyByMember, name)
 	}
 	delete(parties, pid)
+
+	BroadcastSocialSync(SocialSyncPayload{
+		Action:   "PARTY_DISBAND",
+		Party:    p,
+		Removals: members,
+	})
+
 	return map[string]interface{}{
 		"party_id":  pid,
 		"leader":    leader,
@@ -902,10 +917,24 @@ func partyLeave(member string) (map[string]interface{}, bool, string) {
 			delete(partyByMember, name)
 		}
 		delete(parties, p.ID)
+
+		BroadcastSocialSync(SocialSyncPayload{
+			Action:   "PARTY_DISBAND",
+			Party:    p,
+			Removals: append(remaining, member),
+		})
+
 		return map[string]interface{}{"party_id": pid, "dissolved": true, "remaining": remaining}, true, "OK"
 	}
 
-	return map[string]interface{}{"party": partySnapshotLocked(p), "dissolved": false}, true, "OK"
+	snap := partySnapshotLocked(p)
+	BroadcastSocialSync(SocialSyncPayload{
+		Action:   "PARTY_UPDATE",
+		Party:    p,
+		Removals: []string{member},
+	})
+
+	return map[string]interface{}{"party": snap, "dissolved": false}, true, "OK"
 }
 
 func partySnapshotForCharacter(name string) map[string]interface{} {
@@ -1047,8 +1076,15 @@ func setPartyReady(member string, ready bool) (map[string]interface{}, bool, str
 		p.Ready = map[string]bool{}
 	}
 	p.Ready[member] = ready
+
+	snap := partySnapshotLocked(p)
+	BroadcastSocialSync(SocialSyncPayload{
+		Action: "PARTY_UPDATE",
+		Party:  p,
+	})
+
 	return map[string]interface{}{
-		"party": partySnapshotLocked(p),
+		"party": snap,
 		"actor": member,
 		"ready": ready,
 	}, true, "OK"
@@ -1099,23 +1135,13 @@ func broadcastParty(session *ClientSession, message string) bool {
 	if partyID == "" {
 		return false
 	}
-	payload := map[string]interface{}{
-		"channel":  "party",
-		"from":     session.Character.Name,
-		"party_id": partyID,
-		"message":  message,
-		"ts":       time.Now().UTC().Format(time.RFC3339),
-	}
-	for _, memberName := range partyMemberNames(partyID) {
-		other := findSessionByCharacterName(memberName)
-		if other == nil || !other.Authenticated || other.Character == nil {
-			continue
-		}
-		if other != session && !chatDeliveryAllowed(session, other) {
-			continue
-		}
-		sendMessage(other.Conn, ServerMessage{Command: RespChatMessage, Payload: payload})
-	}
+
+	PublishRedisEvent(EvtChatParty, ChatPartyPayload{
+		From:    session.Character.Name,
+		PartyID: partyID,
+		Message: message,
+		Ts:      time.Now().UTC().Format(time.RFC3339),
+	})
 	return true
 }
 
@@ -1142,11 +1168,7 @@ func handleSocialDisconnect(name string) {
 	if dissolved, _ := result["dissolved"].(bool); dissolved {
 		if remaining, ok := result["remaining"].([]string); ok {
 			for _, member := range remaining {
-				target := findSessionByCharacterName(member)
-				if target == nil || !target.Authenticated {
-					continue
-				}
-				sendMessage(target.Conn, ServerMessage{
+				sendMessageToCharacter(member, ServerMessage{
 					Command: RespPartyUpdate,
 					Payload: map[string]interface{}{
 						"event": "PARTY_DISSOLVED",
@@ -1310,6 +1332,12 @@ func guildCreate(member, guildName string) (map[string]interface{}, bool, string
 		Leader:  member,
 		Members: map[string]string{member: "leader"},
 	}
+
+	BroadcastSocialSync(SocialSyncPayload{
+		Action: "GUILD_UPDATE",
+		Guild:  guilds[guild],
+	})
+
 	return map[string]interface{}{"guild": guild, "member": member, "role": "leader"}, true, "OK"
 }
 
@@ -1333,6 +1361,12 @@ func guildJoin(member, guildName string) (map[string]interface{}, bool, string) 
 		return nil, false, "ALREADY_IN_GUILD"
 	}
 	g.Members[member] = "member"
+
+	BroadcastSocialSync(SocialSyncPayload{
+		Action: "GUILD_UPDATE",
+		Guild:  g,
+	})
+
 	return map[string]interface{}{"guild": guild, "member": member, "role": "member"}, true, "OK"
 }
 
@@ -1367,11 +1401,17 @@ func guildInvite(inviter, target, guildName string) (map[string]interface{}, boo
 		return nil, false, "TARGET_ALREADY_IN_GUILD"
 	}
 
-	guildInvites[target] = GuildInvite{
+	invite := GuildInvite{
 		GuildName: guild,
 		From:      inviter,
 		ExpiresAt: time.Now().UTC().Add(guildInviteTTL),
 	}
+	guildInvites[target] = invite
+	BroadcastSocialSync(SocialSyncPayload{
+		Action:      "GUILD_INVITE_SET",
+		Target:      target,
+		GuildInvite: &invite,
+	})
 	return map[string]interface{}{"from": inviter, "to": target, "guild": guild, "expires_sec": int(guildInviteTTL.Seconds())}, true, "OK"
 }
 
@@ -1397,12 +1437,14 @@ func guildCancelInvite(inviter, target, guildName string) (map[string]interface{
 	}
 	if time.Now().UTC().After(invite.ExpiresAt) {
 		delete(guildInvites, target)
+		BroadcastSocialSync(SocialSyncPayload{Action: "GUILD_INVITE_CLEAR", Target: target})
 		return nil, false, "INVITE_EXPIRED"
 	}
 	if invite.From != inviter || invite.GuildName != guild {
 		return nil, false, "NOT_INVITER"
 	}
 	delete(guildInvites, target)
+	BroadcastSocialSync(SocialSyncPayload{Action: "GUILD_INVITE_CLEAR", Target: target})
 	return map[string]interface{}{
 		"from":  inviter,
 		"to":    target,
@@ -1425,6 +1467,7 @@ func guildAccept(target, from string) (map[string]interface{}, bool, string) {
 	}
 	if time.Now().UTC().After(invite.ExpiresAt) {
 		delete(guildInvites, target)
+		BroadcastSocialSync(SocialSyncPayload{Action: "GUILD_INVITE_CLEAR", Target: target})
 		return nil, false, "INVITE_EXPIRED"
 	}
 	if from != "" && from != invite.From {
@@ -1432,19 +1475,29 @@ func guildAccept(target, from string) (map[string]interface{}, bool, string) {
 	}
 	if isBlocked(invite.From, target) || isBlocked(target, invite.From) {
 		delete(guildInvites, target)
+		BroadcastSocialSync(SocialSyncPayload{Action: "GUILD_INVITE_CLEAR", Target: target})
 		return nil, false, "BLOCKED"
 	}
 	g := guilds[invite.GuildName]
 	if g == nil {
 		delete(guildInvites, target)
+		BroadcastSocialSync(SocialSyncPayload{Action: "GUILD_INVITE_CLEAR", Target: target})
 		return nil, false, "GUILD_NOT_FOUND"
 	}
 	if _, exists := g.Members[target]; exists {
 		delete(guildInvites, target)
+		BroadcastSocialSync(SocialSyncPayload{Action: "GUILD_INVITE_CLEAR", Target: target})
 		return nil, false, "ALREADY_IN_GUILD"
 	}
 	g.Members[target] = "member"
 	delete(guildInvites, target)
+	BroadcastSocialSync(SocialSyncPayload{Action: "GUILD_INVITE_CLEAR", Target: target})
+
+	BroadcastSocialSync(SocialSyncPayload{
+		Action: "GUILD_UPDATE",
+		Guild:  g,
+	})
+
 	return map[string]interface{}{"guild": invite.GuildName, "member": target, "role": "member", "from": invite.From}, true, "OK"
 }
 
@@ -1463,12 +1516,14 @@ func guildDecline(target, from string) (map[string]interface{}, bool, string) {
 	}
 	if time.Now().UTC().After(invite.ExpiresAt) {
 		delete(guildInvites, target)
+		BroadcastSocialSync(SocialSyncPayload{Action: "GUILD_INVITE_CLEAR", Target: target})
 		return nil, false, "INVITE_EXPIRED"
 	}
 	if from != "" && from != invite.From {
 		return nil, false, "INVITE_MISMATCH"
 	}
 	delete(guildInvites, target)
+	BroadcastSocialSync(SocialSyncPayload{Action: "GUILD_INVITE_CLEAR", Target: target})
 	return map[string]interface{}{
 		"from":  invite.From,
 		"to":    target,
@@ -1499,6 +1554,13 @@ func guildLeave(member, guildName string) (map[string]interface{}, bool, string)
 	delete(g.Members, member)
 	if len(g.Members) == 0 {
 		delete(guilds, guild)
+
+		BroadcastSocialSync(SocialSyncPayload{
+			Action:   "GUILD_DISBAND",
+			Guild:    g,
+			Removals: []string{member},
+		})
+
 		return map[string]interface{}{"guild": guild, "member": member, "disbanded": true}, true, "OK"
 	}
 
@@ -1511,6 +1573,13 @@ func guildLeave(member, guildName string) (map[string]interface{}, bool, string)
 		g.Leader = names[0]
 		g.Members[g.Leader] = "leader"
 	}
+
+	BroadcastSocialSync(SocialSyncPayload{
+		Action:   "GUILD_UPDATE",
+		Guild:    g,
+		Removals: []string{member},
+	})
+
 	return map[string]interface{}{"guild": guild, "member": member, "leader": g.Leader, "disbanded": false}, true, "OK"
 }
 
@@ -1545,6 +1614,13 @@ func guildDisband(actor, guildName string) (map[string]interface{}, bool, string
 			delete(guildInvites, invitee)
 		}
 	}
+
+	BroadcastSocialSync(SocialSyncPayload{
+		Action:   "GUILD_DISBAND",
+		Guild:    g,
+		Removals: members,
+	})
+
 	return map[string]interface{}{
 		"guild":     guild,
 		"actor":     actor,
@@ -1588,6 +1664,13 @@ func guildKick(actor, target, guildName string) (map[string]interface{}, bool, s
 		return nil, false, "INVALID_TARGET"
 	}
 	delete(g.Members, target)
+
+	BroadcastSocialSync(SocialSyncPayload{
+		Action:   "GUILD_UPDATE",
+		Guild:    g,
+		Removals: []string{target},
+	})
+
 	return map[string]interface{}{
 		"guild":  guild,
 		"actor":  actor,
@@ -1631,6 +1714,12 @@ func guildPromote(actor, target, guildName string) (map[string]interface{}, bool
 	}
 
 	g.Members[target] = "officer"
+
+	BroadcastSocialSync(SocialSyncPayload{
+		Action: "GUILD_UPDATE",
+		Guild:  g,
+	})
+
 	return map[string]interface{}{
 		"guild":  guild,
 		"actor":  actor,
@@ -1674,6 +1763,12 @@ func guildDemote(actor, target, guildName string) (map[string]interface{}, bool,
 	}
 
 	g.Members[target] = "member"
+
+	BroadcastSocialSync(SocialSyncPayload{
+		Action: "GUILD_UPDATE",
+		Guild:  g,
+	})
+
 	return map[string]interface{}{
 		"guild":  guild,
 		"actor":  actor,
@@ -1711,6 +1806,12 @@ func guildTransferLeader(actor, target, guildName string) (map[string]interface{
 	g.Members[actor] = "member"
 	g.Members[target] = "leader"
 	g.Leader = target
+
+	BroadcastSocialSync(SocialSyncPayload{
+		Action: "GUILD_UPDATE",
+		Guild:  g,
+	})
+
 	return map[string]interface{}{
 		"guild":      guild,
 		"from":       actor,

@@ -3,12 +3,11 @@ package main
 import (
 	"encoding/json"
 	"log"
-	"net"
 	"strings"
 	"time"
 )
 
-func handleClientCommand(conn net.Conn, session *ClientSession, visible map[*ClientSession]bool, peerKey string, boundName *string, cmd string, rawPayload interface{}) (bool, bool) {
+func handleClientCommand(conn WSConn, session *ClientSession, visible map[*ClientSession]bool, peerKey string, boundName *string, cmd string, rawPayload interface{}) (bool, bool) {
 	switch cmd {
 	case ReqMove:
 		data, _ := json.Marshal(rawPayload)
@@ -23,6 +22,26 @@ func handleClientCommand(conn net.Conn, session *ClientSession, visible map[*Cli
 		}
 		session.Position = newPos
 		sendMessage(conn, ServerMessage{Command: RespMoveOK, Payload: session.Position})
+		updateVisibilityForMove(session, visible)
+		return true, true
+
+	case ReqTeleport:
+		payload := toMap(rawPayload)
+		worldID := WorldID(toInt(payload, "world_id"))
+		target, exists := worlds[worldID]
+		if !exists {
+			sendMessage(conn, ServerMessage{Command: RespError, Payload: "INVALID_WORLD"})
+			return true, false
+		}
+		// In a real game, check if the player has permission or is near a teleporter NPC
+		session.Character.WorldID = worldID
+		session.World = target
+		session.Position = DefaultSpawnPosition(worldID)
+		sendMessage(conn, ServerMessage{Command: RespTeleportOK, Payload: map[string]interface{}{
+			"world": target.Name,
+			"spawn": session.Position,
+		}})
+		// Notify visibility system of a major warp
 		updateVisibilityForMove(session, visible)
 		return true, true
 
@@ -564,8 +583,7 @@ func handleClientCommand(conn net.Conn, session *ClientSession, visible map[*Cli
 	case ReqPartyInvite:
 		payload := toMap(rawPayload)
 		target := toString(payload, "target")
-		targetSession := findSessionByCharacterName(target)
-		if targetSession == nil || !targetSession.Authenticated {
+		if !isCharacterOnlineAnywhere(target) {
 			sendMessage(conn, ServerMessage{Command: RespPartyRejected, Payload: "TARGET_OFFLINE"})
 			return true, false
 		}
@@ -574,7 +592,7 @@ func handleClientCommand(conn net.Conn, session *ClientSession, visible map[*Cli
 			sendMessage(conn, ServerMessage{Command: RespPartyRejected, Payload: reason})
 			return true, false
 		}
-		sendMessage(targetSession.Conn, ServerMessage{Command: RespPartyInvite, Payload: map[string]interface{}{"from": session.Character.Name}})
+		sendMessageToCharacter(target, ServerMessage{Command: RespPartyInvite, Payload: map[string]interface{}{"from": session.Character.Name}})
 		sendMessage(conn, ServerMessage{Command: RespPartyUpdate, Payload: map[string]interface{}{"event": "INVITE_SENT", "invite": result}})
 		return true, false
 	case ReqPartyCancel:
@@ -585,9 +603,7 @@ func handleClientCommand(conn net.Conn, session *ClientSession, visible map[*Cli
 			sendMessage(conn, ServerMessage{Command: RespPartyRejected, Payload: reason})
 			return true, false
 		}
-		if targetSession := findSessionByCharacterName(target); targetSession != nil && targetSession.Authenticated {
-			sendMessage(targetSession.Conn, ServerMessage{Command: RespPartyUpdate, Payload: map[string]interface{}{"event": "INVITE_CANCELED", "from": session.Character.Name}})
-		}
+		sendMessageToCharacter(target, ServerMessage{Command: RespPartyUpdate, Payload: map[string]interface{}{"event": "INVITE_CANCELED", "from": session.Character.Name}})
 		sendMessage(conn, ServerMessage{Command: RespPartyUpdate, Payload: map[string]interface{}{"event": "INVITE_CANCELED", "target": target, "invite": result}})
 		return true, false
 	case ReqPartyAccept:
@@ -610,9 +626,7 @@ func handleClientCommand(conn net.Conn, session *ClientSession, visible map[*Cli
 			return true, false
 		}
 		inviter := toString(result, "from")
-		if inviterSession := findSessionByCharacterName(inviter); inviterSession != nil && inviterSession.Authenticated {
-			sendMessage(inviterSession.Conn, ServerMessage{Command: RespPartyUpdate, Payload: map[string]interface{}{"event": "INVITE_DECLINED", "target": session.Character.Name}})
-		}
+		sendMessageToCharacter(inviter, ServerMessage{Command: RespPartyUpdate, Payload: map[string]interface{}{"event": "INVITE_DECLINED", "target": session.Character.Name}})
 		sendMessage(conn, ServerMessage{Command: RespPartyUpdate, Payload: map[string]interface{}{"event": "DECLINED", "from": inviter}})
 		return true, false
 	case ReqPartyLeave:
@@ -624,11 +638,7 @@ func handleClientCommand(conn net.Conn, session *ClientSession, visible map[*Cli
 		if dissolved, _ := result["dissolved"].(bool); dissolved {
 			if remaining, ok := result["remaining"].([]string); ok {
 				for _, member := range remaining {
-					target := findSessionByCharacterName(member)
-					if target == nil || !target.Authenticated {
-						continue
-					}
-					sendMessage(target.Conn, ServerMessage{Command: RespPartyUpdate, Payload: map[string]interface{}{"event": "PARTY_DISSOLVED", "actor": session.Character.Name}})
+					sendMessageToCharacter(member, ServerMessage{Command: RespPartyUpdate, Payload: map[string]interface{}{"event": "PARTY_DISSOLVED", "actor": session.Character.Name}})
 				}
 			}
 			sendMessage(conn, ServerMessage{Command: RespPartyUpdate, Payload: map[string]interface{}{"event": "PARTY_DISSOLVED"}})
@@ -647,20 +657,14 @@ func handleClientCommand(conn net.Conn, session *ClientSession, visible map[*Cli
 			sendMessage(conn, ServerMessage{Command: RespPartyRejected, Payload: reason})
 			return true, false
 		}
-		if targetSession := findSessionByCharacterName(target); targetSession != nil && targetSession.Authenticated {
-			sendMessage(targetSession.Conn, ServerMessage{Command: RespPartyUpdate, Payload: map[string]interface{}{"event": "KICKED", "actor": session.Character.Name}})
-		}
+		sendMessageToCharacter(target, ServerMessage{Command: RespPartyUpdate, Payload: map[string]interface{}{"event": "KICKED", "actor": session.Character.Name}})
 		if dissolved, _ := result["dissolved"].(bool); dissolved {
 			if remaining, ok := result["remaining"].([]string); ok {
 				for _, member := range remaining {
 					if member == session.Character.Name {
 						continue
 					}
-					target := findSessionByCharacterName(member)
-					if target == nil || !target.Authenticated {
-						continue
-					}
-					sendMessage(target.Conn, ServerMessage{Command: RespPartyUpdate, Payload: map[string]interface{}{"event": "PARTY_DISSOLVED", "actor": session.Character.Name}})
+					sendMessageToCharacter(member, ServerMessage{Command: RespPartyUpdate, Payload: map[string]interface{}{"event": "PARTY_DISSOLVED", "actor": session.Character.Name}})
 				}
 			}
 			sendMessage(conn, ServerMessage{Command: RespPartyUpdate, Payload: map[string]interface{}{"event": "PARTY_DISSOLVED", "actor": session.Character.Name}})
@@ -690,12 +694,8 @@ func handleClientCommand(conn net.Conn, session *ClientSession, visible map[*Cli
 		}
 		members, _ := result["members"].([]string)
 		for _, member := range members {
-			target := findSessionByCharacterName(member)
-			if target == nil || !target.Authenticated {
-				continue
-			}
 			payload := map[string]interface{}{"event": "PARTY_DISBANDED", "actor": session.Character.Name, "party": nil}
-			sendMessage(target.Conn, ServerMessage{Command: RespPartyUpdate, Payload: payload})
+			sendMessageToCharacter(member, ServerMessage{Command: RespPartyUpdate, Payload: payload})
 		}
 		return true, false
 	case ReqPartyReady:
@@ -762,12 +762,11 @@ func handleClientCommand(conn net.Conn, session *ClientSession, visible map[*Cli
 		}
 		payload := toMap(rawPayload)
 		target := toString(payload, "target")
-		targetSession := findSessionByCharacterName(target)
-		if targetSession == nil || !targetSession.Authenticated || targetSession.Character == nil {
+		if !isCharacterOnlineAnywhere(target) {
 			sendMessage(conn, ServerMessage{Command: RespGuildRejected, Payload: "TARGET_OFFLINE"})
 			return true, false
 		}
-		if strings.TrimSpace(targetSession.Character.Guild) != "" {
+		if strings.TrimSpace(characterGuildName(target)) != "" {
 			sendMessage(conn, ServerMessage{Command: RespGuildRejected, Payload: "TARGET_ALREADY_IN_GUILD"})
 			return true, false
 		}
@@ -776,7 +775,7 @@ func handleClientCommand(conn net.Conn, session *ClientSession, visible map[*Cli
 			sendMessage(conn, ServerMessage{Command: RespGuildRejected, Payload: reason})
 			return true, false
 		}
-		sendMessage(targetSession.Conn, ServerMessage{Command: RespGuildUpdate, Payload: map[string]interface{}{"event": "INVITED", "guild": toString(result, "guild"), "from": session.Character.Name, "expires_sec": result["expires_sec"]}})
+		sendMessageToCharacter(target, ServerMessage{Command: RespGuildUpdate, Payload: map[string]interface{}{"event": "INVITED", "guild": toString(result, "guild"), "from": session.Character.Name, "expires_sec": result["expires_sec"]}})
 		sendMessage(conn, ServerMessage{Command: RespGuildUpdate, Payload: map[string]interface{}{"event": "INVITE_SENT", "target": target, "guild": session.Character.Guild}})
 		return true, false
 	case ReqGuildCancel:
@@ -791,9 +790,7 @@ func handleClientCommand(conn net.Conn, session *ClientSession, visible map[*Cli
 			sendMessage(conn, ServerMessage{Command: RespGuildRejected, Payload: reason})
 			return true, false
 		}
-		if targetSession := findSessionByCharacterName(target); targetSession != nil && targetSession.Authenticated && targetSession.Character != nil {
-			sendMessage(targetSession.Conn, ServerMessage{Command: RespGuildUpdate, Payload: map[string]interface{}{"event": "INVITE_CANCELED", "from": session.Character.Name, "guild": toString(result, "guild")}})
-		}
+		sendMessageToCharacter(target, ServerMessage{Command: RespGuildUpdate, Payload: map[string]interface{}{"event": "INVITE_CANCELED", "from": session.Character.Name, "guild": toString(result, "guild")}})
 		sendMessage(conn, ServerMessage{Command: RespGuildUpdate, Payload: map[string]interface{}{"event": "INVITE_CANCELED", "target": target, "guild": toString(result, "guild")}})
 		return true, false
 	case ReqGuildAccept:
@@ -824,9 +821,7 @@ func handleClientCommand(conn net.Conn, session *ClientSession, visible map[*Cli
 			return true, false
 		}
 		inviter := toString(result, "from")
-		if inviterSession := findSessionByCharacterName(inviter); inviterSession != nil && inviterSession.Authenticated && inviterSession.Character != nil {
-			sendMessage(inviterSession.Conn, ServerMessage{Command: RespGuildUpdate, Payload: map[string]interface{}{"event": "INVITE_DECLINED", "target": session.Character.Name, "guild": toString(result, "guild")}})
-		}
+		sendMessageToCharacter(inviter, ServerMessage{Command: RespGuildUpdate, Payload: map[string]interface{}{"event": "INVITE_DECLINED", "target": session.Character.Name, "guild": toString(result, "guild")}})
 		sendMessage(conn, ServerMessage{Command: RespGuildUpdate, Payload: map[string]interface{}{"event": "DECLINED", "from": inviter, "guild": toString(result, "guild")}})
 		return true, false
 	case ReqGuildKick:
@@ -844,8 +839,8 @@ func handleClientCommand(conn net.Conn, session *ClientSession, visible map[*Cli
 		if targetSession := findSessionByCharacterName(target); targetSession != nil && targetSession.Authenticated && targetSession.Character != nil {
 			targetSession.Character.Guild = ""
 			targetSession.Character.GuildRole = ""
-			sendMessage(targetSession.Conn, ServerMessage{Command: RespGuildUpdate, Payload: map[string]interface{}{"event": "KICKED", "guild": session.Character.Guild, "by": session.Character.Name}})
 		}
+		sendMessageToCharacter(target, ServerMessage{Command: RespGuildUpdate, Payload: map[string]interface{}{"event": "KICKED", "guild": session.Character.Guild, "by": session.Character.Name}})
 		sendMessage(conn, ServerMessage{Command: RespGuildUpdate, Payload: map[string]interface{}{"event": "KICKED_MEMBER", "target": target, "guild": toString(result, "guild")}})
 		return true, true
 	case ReqGuildPromote:
@@ -862,8 +857,8 @@ func handleClientCommand(conn net.Conn, session *ClientSession, visible map[*Cli
 		}
 		if targetSession := findSessionByCharacterName(target); targetSession != nil && targetSession.Authenticated && targetSession.Character != nil {
 			targetSession.Character.GuildRole = "officer"
-			sendMessage(targetSession.Conn, ServerMessage{Command: RespGuildUpdate, Payload: map[string]interface{}{"event": "PROMOTED", "guild": session.Character.Guild, "by": session.Character.Name, "role": "officer"}})
 		}
+		sendMessageToCharacter(target, ServerMessage{Command: RespGuildUpdate, Payload: map[string]interface{}{"event": "PROMOTED", "guild": session.Character.Guild, "by": session.Character.Name, "role": "officer"}})
 		sendMessage(conn, ServerMessage{Command: RespGuildUpdate, Payload: map[string]interface{}{"event": "PROMOTED_MEMBER", "target": target, "guild": toString(result, "guild"), "role": "officer"}})
 		return true, true
 	case ReqGuildDemote:
@@ -880,8 +875,8 @@ func handleClientCommand(conn net.Conn, session *ClientSession, visible map[*Cli
 		}
 		if targetSession := findSessionByCharacterName(target); targetSession != nil && targetSession.Authenticated && targetSession.Character != nil {
 			targetSession.Character.GuildRole = "member"
-			sendMessage(targetSession.Conn, ServerMessage{Command: RespGuildUpdate, Payload: map[string]interface{}{"event": "DEMOTED", "guild": session.Character.Guild, "by": session.Character.Name, "role": "member"}})
 		}
+		sendMessageToCharacter(target, ServerMessage{Command: RespGuildUpdate, Payload: map[string]interface{}{"event": "DEMOTED", "guild": session.Character.Guild, "by": session.Character.Name, "role": "member"}})
 		sendMessage(conn, ServerMessage{Command: RespGuildUpdate, Payload: map[string]interface{}{"event": "DEMOTED_MEMBER", "target": target, "guild": toString(result, "guild"), "role": "member"}})
 		return true, true
 	case ReqGuildTransfer:
@@ -899,8 +894,8 @@ func handleClientCommand(conn net.Conn, session *ClientSession, visible map[*Cli
 		session.Character.GuildRole = "member"
 		if targetSession := findSessionByCharacterName(target); targetSession != nil && targetSession.Authenticated && targetSession.Character != nil {
 			targetSession.Character.GuildRole = "leader"
-			sendMessage(targetSession.Conn, ServerMessage{Command: RespGuildUpdate, Payload: map[string]interface{}{"event": "LEADERSHIP_GRANTED", "guild": session.Character.Guild, "from": session.Character.Name}})
 		}
+		sendMessageToCharacter(target, ServerMessage{Command: RespGuildUpdate, Payload: map[string]interface{}{"event": "LEADERSHIP_GRANTED", "guild": session.Character.Guild, "from": session.Character.Name}})
 		sendMessage(conn, ServerMessage{Command: RespGuildUpdate, Payload: map[string]interface{}{"event": "LEADERSHIP_TRANSFERRED", "guild": session.Character.Guild, "to": target}})
 		return true, true
 	case ReqGuildDisband:
@@ -917,13 +912,12 @@ func handleClientCommand(conn net.Conn, session *ClientSession, visible map[*Cli
 		members, _ := result["members"].([]string)
 		for _, member := range members {
 			target := findSessionByCharacterName(member)
-			if target == nil || !target.Authenticated || target.Character == nil {
-				continue
+			if target != nil && target.Authenticated && target.Character != nil {
+				target.Character.Guild = ""
+				target.Character.GuildRole = ""
 			}
-			target.Character.Guild = ""
-			target.Character.GuildRole = ""
-			sendMessage(target.Conn, ServerMessage{Command: RespGuildUpdate, Payload: map[string]interface{}{"event": "DISBANDED", "guild": guildName, "by": session.Character.Name}})
-			if member != session.Character.Name {
+			sendMessageToCharacter(member, ServerMessage{Command: RespGuildUpdate, Payload: map[string]interface{}{"event": "DISBANDED", "guild": guildName, "by": session.Character.Name}})
+			if target != nil && target.Authenticated && target.Character != nil && member != session.Character.Name {
 				if err := persistCharacter(target.Character); err != nil {
 					log.Printf("Failed to persist disband member %s: %v", target.Character.Name, err)
 				}
@@ -957,7 +951,7 @@ func handleClientCommand(conn net.Conn, session *ClientSession, visible map[*Cli
 	}
 }
 
-func handleAuthToken(conn net.Conn, session *ClientSession, visible map[*ClientSession]bool, peerKey string, boundName *string, rawPayload interface{}) (bool, bool) {
+func handleAuthToken(conn WSConn, session *ClientSession, visible map[*ClientSession]bool, peerKey string, boundName *string, rawPayload interface{}) (bool, bool) {
 	if ok, wait := allowZoneAuthAttempt(peerKey); !ok {
 		sendMessage(conn, ServerMessage{Command: RespAuthLocked, Payload: map[string]interface{}{"reason": "TOO_MANY_ATTEMPTS", "retry_after_sec": int(wait.Seconds())}})
 		session.Active = false
@@ -1022,6 +1016,7 @@ func handleAuthToken(conn net.Conn, session *ClientSession, visible map[*ClientS
 	*boundName = loaded.Name
 	registerGuildMember(loaded.Guild, loaded.Name, loaded.GuildRole)
 	loaded.GuildRole = guildRoleOfMember(loaded.Name, loaded.Guild)
+	markCharacterOnline(loaded.Name)
 
 	sendMessage(conn, ServerMessage{Command: RespAuthOK, Payload: map[string]interface{}{"name": loaded.Name, "class": loaded.Class, "world": targetWorld.Name}})
 	sendMessage(conn, ServerMessage{Command: RespEnterOK, Payload: map[string]interface{}{"character": loaded.Name, "world": targetWorld.Name, "spawn": session.Position}})
@@ -1030,7 +1025,7 @@ func handleAuthToken(conn net.Conn, session *ClientSession, visible map[*ClientS
 	return true, false
 }
 
-func rejectAuthToken(conn net.Conn, session *ClientSession, reason string) {
+func rejectAuthToken(conn WSConn, session *ClientSession, reason string) {
 	session.AuthFailures++
 	sendMessage(conn, ServerMessage{Command: RespAuthRejected, Payload: reason})
 	time.Sleep(time.Duration(session.AuthFailures*150) * time.Millisecond)
@@ -1049,8 +1044,24 @@ func updateVisibilityForMove(session *ClientSession, visible map[*ClientSession]
 		wasVisible := visible[other]
 		switch {
 		case nowVisible && !wasVisible:
-			sendMessage(other.Conn, ServerMessage{Command: RespPlayerJoined, Payload: map[string]interface{}{"name": session.Character.Name, "pos": session.Position}})
-			sendMessage(session.Conn, ServerMessage{Command: RespPlayerJoined, Payload: map[string]interface{}{"name": other.Character.Name, "pos": other.Position}})
+			sendMessage(other.Conn, ServerMessage{
+				Command: RespPlayerJoined,
+				Payload: map[string]interface{}{
+					"name":   session.Character.Name,
+					"pos":    session.Position,
+					"class":  session.Character.Class,
+					"weapon": getWeaponType(session.Character),
+				},
+			})
+			sendMessage(session.Conn, ServerMessage{
+				Command: RespPlayerJoined,
+				Payload: map[string]interface{}{
+					"name":   other.Character.Name,
+					"pos":    other.Position,
+					"class":  other.Character.Class,
+					"weapon": getWeaponType(other.Character),
+				},
+			})
 			visible[other] = true
 		case !nowVisible && wasVisible:
 			sendMessage(other.Conn, ServerMessage{Command: RespPlayerLeft, Payload: session.Character.Name})
@@ -1108,11 +1119,7 @@ func notifyPartyMembers(partyID, event, actor string) {
 	}
 	partyState := partySnapshotForCharacter(memberNames[0])
 	for _, name := range memberNames {
-		target := findSessionByCharacterName(name)
-		if target == nil || !target.Authenticated {
-			continue
-		}
-		sendMessage(target.Conn, ServerMessage{
+		sendMessageToCharacter(name, ServerMessage{
 			Command: RespPartyUpdate,
 			Payload: map[string]interface{}{
 				"event": event,

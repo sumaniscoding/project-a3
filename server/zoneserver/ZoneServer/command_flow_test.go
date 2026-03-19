@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"io"
-	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -24,18 +23,24 @@ type captureConn struct {
 	buf bytes.Buffer
 }
 
-func (c *captureConn) Read(_ []byte) (int, error)         { return 0, io.EOF }
-func (c *captureConn) Close() error                       { return nil }
-func (c *captureConn) LocalAddr() net.Addr                { return testAddr("local") }
-func (c *captureConn) RemoteAddr() net.Addr               { return testAddr("remote") }
-func (c *captureConn) SetDeadline(_ time.Time) error      { return nil }
-func (c *captureConn) SetReadDeadline(_ time.Time) error  { return nil }
-func (c *captureConn) SetWriteDeadline(_ time.Time) error { return nil }
+func (c *captureConn) Read(_ []byte) (int, error)  { return 0, io.EOF }
+func (c *captureConn) Close() error                { return nil }
 
 func (c *captureConn) Write(p []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.buf.Write(p)
+}
+
+// WriteJSON satisfies WSConn interface; serialises msg as a JSON line.
+func (c *captureConn) WriteJSON(v interface{}) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	_, err = c.Write(data)
+	return err
 }
 
 func (c *captureConn) DrainMessages(t *testing.T) []ServerMessage {

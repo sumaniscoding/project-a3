@@ -75,6 +75,7 @@ const (
 	ReqGuildPromote   = "GUILD_PROMOTE"
 	ReqGuildDemote    = "GUILD_DEMOTE"
 	ReqGuildTransfer  = "GUILD_TRANSFER_LEADER"
+	ReqTeleport       = "TELEPORT"
 )
 
 const (
@@ -146,6 +147,7 @@ const (
 	RespGuildList         = "GUILD_LIST"
 	RespGuildRejected     = "GUILD_REJECTED"
 	RespGuildMembers      = "GUILD_MEMBERS"
+	RespTeleportOK        = "TELEPORT_OK"
 )
 
 const (

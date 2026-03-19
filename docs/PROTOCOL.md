@@ -7,16 +7,19 @@ All messages are JSON objects terminated by a newline (`\\n`).
 ### Requests
 
 - `{"command":"PING"}`
-- `{"command":"LOGIN","username":"demo","password":"demo"}`
+- `{"command":"REGISTER","username":"demo","password":"demo-pass"}`
+- `{"command":"LOGIN","username":"demo","password":"demo-pass"}`
 - `{"command":"VALIDATE","token":"<signed token>"}` (debug validation)
 
 ### Responses
 
 - `PONG` with timestamp payload
+- `REGISTER_OK` with `username`
+- `REGISTER_DENIED` with `ACCOUNT_EXISTS` or `MISSING_CREDENTIALS`
 - `LOGIN_OK` with `username`, `token`, and `expires`
 - `RATE_LIMITED` with `retry_after_sec` when peer IP login attempts exceed throttle limits
 - `TOKEN_VALID` / `TOKEN_INVALID` for validation checks
-- `LOGIN_DENIED` for missing credentials
+- `LOGIN_DENIED` for missing or invalid credentials
 - `ERROR` for invalid JSON/unknown command/internal error
 
 Token notes:
@@ -25,6 +28,8 @@ Token notes:
 - Tokens also include `iss`, `ver`, and `iat` claims and are rejected if invalid.
 - LoginServer and ZoneServer must share `A3_AUTH_SECRET` (defaults to a dev secret if unset).
 - In production (`A3_ENV=prod`), startup fails if `A3_AUTH_SECRET` is unset or default.
+- Login credentials are stored in SQLite at `server/LoginServer/data/login_accounts.db`.
+- Browser-origin WebSocket connections must match `A3_ALLOWED_ORIGINS` when set; native clients without an `Origin` header remain allowed.
 
 ## ZoneServer (`:7777`)
 
@@ -90,7 +95,7 @@ Responses:
 - `STORAGE_DEPOSIT_GOLD` / `STORAGE_WITHDRAW_GOLD` with payload `{"amount":100}`
 - `CHAT_SAY` with payload `{"message":"hello"}` for local proximity chat in current world
 - `CHAT_WORLD` with payload `{"message":"hello world"}` for world-wide chat in current world
-- `CHAT_WHISPER` with payload `{"target":"PlayerName","message":"psst"}` for direct private messages
+- `CHAT_WHISPER` with payload `{"target":"PlayerName","message":"psst"}` for direct private messages across ZoneServer nodes when Redis is available
 - `SET_PRESENCE` with payload `{"status":"online|afk|dnd"}` to update presence state
 - `GET_PRESENCE` to fetch the current presence state
 - `WHO` for authenticated online roster
@@ -104,7 +109,7 @@ Responses:
 - `BLOCK_PLAYER` with payload `{"target":"PlayerName"}` to block direct interactions
 - `UNBLOCK_PLAYER` with payload `{"target":"PlayerName"}` to remove a block
 - `BLOCK_LIST` to return the current blocked roster
-- `PARTY_INVITE`, `PARTY_ACCEPT`, `PARTY_LEAVE` for party flow
+- `PARTY_INVITE`, `PARTY_ACCEPT`, `PARTY_LEAVE` for party flow, including cross-node invite delivery when Redis is available
 - `PARTY_CANCEL_INVITE` with payload `{"target":"PlayerName"}` to revoke a pending invite you sent
 - `PARTY_DECLINE` with payload `{"from":"PlayerName"}` to reject a pending party invite
 - `PARTY_READY` with payload `{"ready":true|false}` to mark encounter readiness
@@ -117,7 +122,7 @@ Responses:
 - `GUILD_DISBAND` for leader-only immediate guild dissolution
 - `CHAT_GUILD` with payload `{"message":"hello guild"}` for guild channel chat
 - `GUILD_MEMBERS` to list guild roster and online state
-- `GUILD_INVITE` with payload `{"target":"PlayerName"}` for leader/officer invites
+- `GUILD_INVITE` with payload `{"target":"PlayerName"}` for leader/officer invites, including cross-node invite delivery when Redis is available
 - `GUILD_CANCEL_INVITE` with payload `{"target":"PlayerName"}` to revoke a pending guild invite you sent
 - `GUILD_ACCEPT` with payload `{"from":"LeaderName"}` to accept pending guild invite
 - `GUILD_DECLINE` with payload `{"from":"LeaderName"}` to reject a pending guild invite

@@ -96,12 +96,12 @@ func storageDepositItem(c *Character, itemID string) (map[string]interface{}, bo
 	if idx < 0 {
 		return nil, false, "ITEM_NOT_FOUND"
 	}
-	if isItemEquippedByPlayer(c, itemID) || isItemEquippedByMerc(c, itemID) {
-		return nil, false, "ITEM_EQUIPPED"
-	}
 	item := c.Inventory[idx]
 	if isStorageRestrictedItem(item) {
 		return nil, false, "ITEM_NOT_STORABLE"
+	}
+	if isItemEquippedByPlayer(c, itemID) || isItemEquippedByMerc(c, itemID) {
+		return nil, false, "ITEM_EQUIPPED"
 	}
 	if storageStackCount(c) >= storageStackLimit {
 		return nil, false, "STORAGE_FULL"

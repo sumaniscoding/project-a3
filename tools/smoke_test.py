@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 import json
-import socket
+import math
 import time
+import urllib.error
+import urllib.request
+
+import websocket
 
 SEND_DELAY_SEC = 0.10
+MOVE_STEP = 9.5
+LOGIN_BASE_URL = "http://127.0.0.1:5555"
+ZONE_BASE_URL = "http://127.0.0.1:7777"
 
 
 class JsonConn:
     def __init__(self, host, port):
-        self.sock = socket.create_connection((host, port), timeout=3)
-        self.file = self.sock.makefile("r", encoding="utf-8", newline="\n")
+        self.sock = websocket.create_connection(f"ws://{host}:{port}/ws", timeout=5)
 
     def send(self, obj):
-        self.sock.sendall((json.dumps(obj) + "\n").encode("utf-8"))
+        self.sock.send(json.dumps(obj))
         time.sleep(SEND_DELAY_SEC)
 
     def recv_until(self, expected_command, timeout=5.0, prefix="[msg]"):
@@ -22,7 +28,13 @@ class JsonConn:
         deadline = time.time() + timeout
         while time.time() < deadline:
             self.sock.settimeout(max(0.1, deadline - time.time()))
-            line = self.file.readline()
+            try:
+                line = self.sock.recv()
+            except websocket.WebSocketTimeoutException:
+                continue
+            except Exception as exc:
+                print(f"{prefix} recv error: {exc}")
+                continue
             if not line:
                 continue
             line = line.strip()
@@ -38,10 +50,38 @@ class JsonConn:
         raise TimeoutError(f"timed out waiting for one of {expected_commands}")
 
     def close(self):
-        try:
-            self.file.close()
-        finally:
-            self.sock.close()
+        self.sock.close()
+
+
+def http_get_json(url, expected_status=200):
+    try:
+        with urllib.request.urlopen(url, timeout=5) as response:
+            status = response.status
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        payload = json.loads(exc.read().decode("utf-8"))
+    if status != expected_status:
+        raise RuntimeError(f"GET {url} returned {status}, expected {expected_status}: {payload!r}")
+    return payload
+
+
+def assert_health_endpoints():
+    login_health = http_get_json(f"{LOGIN_BASE_URL}/healthz")
+    if login_health.get("status") != "ok":
+        raise RuntimeError(f"unexpected login /healthz payload: {login_health!r}")
+
+    login_ready = http_get_json(f"{LOGIN_BASE_URL}/readyz")
+    if login_ready.get("status") != "ready":
+        raise RuntimeError(f"unexpected login /readyz payload: {login_ready!r}")
+
+    zone_health = http_get_json(f"{ZONE_BASE_URL}/healthz")
+    if zone_health.get("status") != "ok":
+        raise RuntimeError(f"unexpected zone /healthz payload: {zone_health!r}")
+
+    zone_ready = http_get_json(f"{ZONE_BASE_URL}/readyz")
+    if zone_ready.get("status") != "ready":
+        raise RuntimeError(f"unexpected zone /readyz payload: {zone_ready!r}")
 
 
 def as_int(value):
@@ -85,6 +125,11 @@ def login_and_get_token(username, password):
         conn.send({"command": "PING"})
         conn.recv_until("PONG", prefix="[login]")
 
+        conn.send({"command": "REGISTER", "username": username, "password": password})
+        register_msg = conn.recv_until_any(["REGISTER_OK", "REGISTER_DENIED"], prefix="[login]")
+        if register_msg.get("command") == "REGISTER_DENIED" and register_msg.get("payload") != "ACCOUNT_EXISTS":
+            raise RuntimeError(f"unexpected register response: {register_msg!r}")
+
         conn.send({"command": "LOGIN", "username": username, "password": password})
         msg = conn.recv_until("LOGIN_OK", prefix="[login]")
         return msg["payload"]["token"]
@@ -103,6 +148,35 @@ def auth_and_get_state(token, class_hint, prefix):
         return auth_ok.get("payload", {}), state_msg.get("payload", {})
     finally:
         conn.close()
+
+
+def move_to(conn, current_pos, target_pos, prefix):
+    x0, y0, z0 = current_pos
+    x1, y1, z1 = target_pos
+    dx = x1 - x0
+    dy = y1 - y0
+    dz = z1 - z0
+    distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if distance == 0:
+        return target_pos
+
+    steps = max(1, math.ceil(distance / MOVE_STEP))
+    for idx in range(1, steps + 1):
+        ratio = idx / steps
+        step_pos = {
+            "x": x0 + dx * ratio,
+            "y": y0 + dy * ratio,
+            "z": z0 + dz * ratio,
+        }
+        conn.send({"command": "MOVE", "payload": step_pos})
+        move_ok = conn.recv_until("MOVE_OK", prefix=prefix)
+        payload = move_ok.get("payload", {})
+        current_pos = (
+            float(payload.get("x", step_pos["x"])),
+            float(payload.get("y", step_pos["y"])),
+            float(payload.get("z", step_pos["z"])),
+        )
+    return current_pos
 
 
 def test_class_bootstrap_and_sticky(token):
@@ -127,475 +201,145 @@ def test_class_bootstrap_and_sticky(token):
         raise RuntimeError(f"unexpected Warrior starter_blade after reauth class hint, got {second_state!r}")
 
 
-def test_zone(token, username):
+def find_visible_mob(payload, mob_id):
+    mobs = payload.get("mobs", [])
+    if not isinstance(mobs, list):
+        return None
+    for mob in mobs:
+        if isinstance(mob, dict) and mob.get("id") == mob_id:
+            return mob
+    return None
+
+
+def defeat_mob(conn, mob_id, skill_id, prefix):
+    for _ in range(18):
+        conn.send({"command": "ATTACK_MOB", "payload": {"mob_id": mob_id, "skill_id": skill_id}})
+        result = conn.recv_until_any(["MOB_ATTACK_RESULT", "MOB_ATTACK_REJECTED"], timeout=6.0, prefix=prefix)
+        if result.get("command") == "MOB_ATTACK_REJECTED":
+            payload = result.get("payload")
+            if payload == "MOB_ALREADY_DEFEATED":
+                time.sleep(0.35)
+                continue
+            raise RuntimeError(f"unexpected mob attack rejection: {result!r}")
+
+        payload = result.get("payload", {})
+        if payload.get("status") == "PLAYER_DIED":
+            conn.send({"command": "RECOVER_CORPSE"})
+            conn.recv_until("CORPSE_RECOVERY", prefix=prefix)
+            continue
+        if payload.get("defeated"):
+            drops = payload.get("drops", [])
+            if not isinstance(drops, list):
+                raise RuntimeError(f"expected drops list, got {payload!r}")
+            return payload
+    raise RuntimeError(f"failed to defeat {mob_id} in smoke test")
+
+
+def test_zone(token):
     print("[zone] connecting to :7777")
     conn = JsonConn("127.0.0.1", 7777)
     try:
         conn.recv_until("AUTH_REQUIRED", prefix="[zone]")
-
-        conn.send({"command": "AUTH_TOKEN", "payload": {"token": token, "class": "Archer"}})
+        conn.send({"command": "AUTH_TOKEN", "payload": {"token": token, "class": "Mage"}})
         conn.recv_until("AUTH_OK", prefix="[zone]")
         conn.recv_until("ENTER_OK", prefix="[zone]")
-        conn.recv_until("STATE", prefix="[zone]")
-
-        conn.send({"command": "GET_STATE"})
         state_msg = conn.recv_until("STATE", prefix="[zone]")
         state_payload = state_msg.get("payload", {})
-        state_before_loot = as_materials_map(state_payload)
+
+        if state_payload.get("class") != "Mage":
+            raise RuntimeError(f"expected Mage state after auth, got {state_payload!r}")
+        if not state_payload.get("world"):
+            raise RuntimeError(f"unexpected starting world: {state_payload!r}")
 
         conn.send({"command": "STORAGE_VIEW"})
         conn.recv_until("STORAGE_STATE", prefix="[zone]")
 
-        conn.send({"command": "STORAGE_DEPOSIT_ITEM", "payload": {"item_id": "starter_bow"}})
-        non_storable = conn.recv_until_any(["STORAGE_STATE", "STORAGE_REJECTED"], prefix="[zone]")
-        if non_storable.get("command") != "STORAGE_REJECTED" or non_storable.get("payload") != "ITEM_NOT_STORABLE":
-            raise RuntimeError(
-                "expected STORAGE_REJECTED/ITEM_NOT_STORABLE for starter_bow deposit, "
-                f"got {non_storable!r}"
-            )
+        deposit_amount = min(25, as_int(state_payload.get("gold")))
+        if deposit_amount <= 0:
+            raise RuntimeError(f"expected positive starter gold, got {state_payload!r}")
 
-        deposit_amount = min(50, as_int(state_payload.get("gold")))
-        if deposit_amount > 0:
-            conn.send({"command": "STORAGE_DEPOSIT_GOLD", "payload": {"amount": deposit_amount}})
-            conn.recv_until("STORAGE_STATE", prefix="[zone]")
+        conn.send({"command": "STORAGE_DEPOSIT_GOLD", "payload": {"amount": deposit_amount}})
+        gold_deposit = conn.recv_until("STORAGE_STATE", prefix="[zone]")
+        gold_payload = gold_deposit.get("payload", {})
+        if as_int(gold_payload.get("wallet_gold")) < deposit_amount:
+            raise RuntimeError(f"expected wallet gold after deposit, got {gold_payload!r}")
 
-            conn.send({"command": "STORAGE_WITHDRAW_GOLD", "payload": {"amount": deposit_amount}})
-            conn.recv_until("STORAGE_STATE", prefix="[zone]")
-        else:
-            conn.send({"command": "STORAGE_DEPOSIT_GOLD", "payload": {"amount": 1}})
-            rejected_gold = conn.recv_until_any(["STORAGE_STATE", "STORAGE_REJECTED"], prefix="[zone]")
-            if rejected_gold.get("command") != "STORAGE_REJECTED":
-                raise RuntimeError(f"expected STORAGE_REJECTED when no on-character gold, got {rejected_gold!r}")
+        conn.send({"command": "STORAGE_WITHDRAW_GOLD", "payload": {"amount": deposit_amount}})
+        conn.recv_until("STORAGE_STATE", prefix="[zone]")
 
-        conn.send({"command": "UPGRADE_GEAR", "payload": {"item_id": "unknown_item"}})
-        conn.recv_until("GEAR_UPGRADE_REJECTED", prefix="[zone]")
-
-        conn.send({"command": "PET_FEED", "payload": {"qty": 1}})
-        pet_feed_before_unlock = conn.recv_until_any(["PET_UPDATE", "PET_REJECTED"], prefix="[zone]")
-        if pet_feed_before_unlock.get("command") != "PET_REJECTED" or pet_feed_before_unlock.get("payload") != "PET_NOT_ACQUIRED":
-            raise RuntimeError(f"expected PET_REJECTED/PET_NOT_ACQUIRED before quest unlock, got {pet_feed_before_unlock!r}")
-
-        conn.send({"command": "WHO"})
-        conn.recv_until("WHO_LIST", prefix="[zone]")
-
-        conn.send({"command": "GET_PRESENCE"})
-        conn.recv_until("PRESENCE_UPDATE", prefix="[zone]")
-
-        conn.send({"command": "SET_PRESENCE", "payload": {"status": "afk"}})
-        conn.recv_until("PRESENCE_UPDATE", prefix="[zone]")
-
-        conn.send({"command": "SET_PRESENCE", "payload": {"status": "busy"}})
-        conn.recv_until("PRESENCE_REJECTED", prefix="[zone]")
-
-        conn.send({"command": "FRIEND_LIST"})
-        conn.recv_until("FRIEND_LIST", prefix="[zone]")
-
-        conn.send({"command": "FRIEND_STATUS"})
-        conn.recv_until("FRIEND_STATUS", prefix="[zone]")
-
-        conn.send({"command": "FRIEND_REQUEST", "payload": {"target": "Nobody"}})
-        conn.recv_until("FRIEND_REJECTED", prefix="[zone]")
-
-        conn.send({"command": "FRIEND_CANCEL_REQUEST", "payload": {"target": "Nobody"}})
-        conn.recv_until("FRIEND_REJECTED", prefix="[zone]")
-
-        conn.send({"command": "FRIEND_ACCEPT", "payload": {"from": "Nobody"}})
-        conn.recv_until("FRIEND_REJECTED", prefix="[zone]")
-
-        conn.send({"command": "FRIEND_DECLINE", "payload": {"from": "Nobody"}})
-        conn.recv_until("FRIEND_REJECTED", prefix="[zone]")
-
-        conn.send({"command": "FRIEND_REMOVE", "payload": {"target": "Nobody"}})
-        conn.recv_until("FRIEND_REJECTED", prefix="[zone]")
-
-        conn.send({"command": "BLOCK_LIST"})
-        conn.recv_until("BLOCK_LIST", prefix="[zone]")
-
-        conn.send({"command": "BLOCK_PLAYER", "payload": {"target": username}})
-        conn.recv_until("BLOCK_REJECTED", prefix="[zone]")
-
-        conn.send({"command": "UNBLOCK_PLAYER", "payload": {"target": "Nobody"}})
-        conn.recv_until("BLOCK_REJECTED", prefix="[zone]")
-
-        conn.send({"command": "CHAT_SAY", "payload": {"message": "hello local"}})
-        conn.recv_until("CHAT_MESSAGE", prefix="[zone]")
-
-        conn.send({"command": "CHAT_WORLD", "payload": {"message": "hello world"}})
-        conn.recv_until("CHAT_MESSAGE", prefix="[zone]")
-
-        conn.send({"command": "CHAT_WHISPER", "payload": {"target": "Nobody", "message": "hello"}})
-        conn.recv_until("WHISPER_REJECTED", prefix="[zone]")
-
-        conn.send({"command": "PARTY_INVITE", "payload": {"target": username}})
-        conn.recv_until("PARTY_REJECTED", prefix="[zone]")
-
-        conn.send({"command": "PARTY_CANCEL_INVITE", "payload": {"target": "Nobody"}})
-        conn.recv_until("PARTY_REJECTED", prefix="[zone]")
-
-        conn.send({"command": "PARTY_ACCEPT", "payload": {"from": "Nobody"}})
-        conn.recv_until("PARTY_REJECTED", prefix="[zone]")
-
-        conn.send({"command": "PARTY_DECLINE", "payload": {"from": "Nobody"}})
-        conn.recv_until("PARTY_REJECTED", prefix="[zone]")
-
-        conn.send({"command": "PARTY_LEAVE"})
-        conn.recv_until("PARTY_REJECTED", prefix="[zone]")
-
-        conn.send({"command": "PARTY_READY", "payload": {"ready": True}})
-        conn.recv_until("PARTY_REJECTED", prefix="[zone]")
-
-        conn.send({"command": "PARTY_STATUS"})
-        conn.recv_until("PARTY_REJECTED", prefix="[zone]")
-
-        conn.send({"command": "CHAT_PARTY", "payload": {"message": "party hello"}})
-        conn.recv_until("PARTY_REJECTED", prefix="[zone]")
-
-        conn.send({"command": "PARTY_KICK", "payload": {"target": "Nobody"}})
-        conn.recv_until("PARTY_REJECTED", prefix="[zone]")
-
-        conn.send({"command": "PARTY_TRANSFER_LEADER", "payload": {"target": "Nobody"}})
-        conn.recv_until("PARTY_REJECTED", prefix="[zone]")
-
-        conn.send({"command": "PARTY_DISBAND"})
-        conn.recv_until("PARTY_REJECTED", prefix="[zone]")
-
-        conn.send({"command": "GUILD_LIST"})
-        conn.recv_until("GUILD_LIST", prefix="[zone]")
-
-        conn.send({"command": "GUILD_LEAVE"})
-        conn.recv_until_any(["GUILD_UPDATE", "GUILD_REJECTED"], prefix="[zone]")
-
-        conn.send({"command": "GUILD_DISBAND"})
-        conn.recv_until("GUILD_REJECTED", prefix="[zone]")
-
-        guild_name = f"SmokeGuild_{int(time.time())}"
-        conn.send({"command": "GUILD_CREATE", "payload": {"name": guild_name}})
-        conn.recv_until("GUILD_UPDATE", prefix="[zone]")
-
-        conn.send({"command": "GUILD_LIST"})
-        conn.recv_until("GUILD_LIST", prefix="[zone]")
-
-        conn.send({"command": "GUILD_MEMBERS"})
-        conn.recv_until("GUILD_MEMBERS", prefix="[zone]")
-
-        conn.send({"command": "GUILD_INVITE", "payload": {"target": username}})
-        conn.recv_until("GUILD_REJECTED", prefix="[zone]")
-
-        conn.send({"command": "GUILD_CANCEL_INVITE", "payload": {"target": "Nobody"}})
-        conn.recv_until("GUILD_REJECTED", prefix="[zone]")
-
-        conn.send({"command": "GUILD_ACCEPT", "payload": {"from": "Nobody"}})
-        conn.recv_until("GUILD_REJECTED", prefix="[zone]")
-
-        conn.send({"command": "GUILD_DECLINE", "payload": {"from": "Nobody"}})
-        conn.recv_until("GUILD_REJECTED", prefix="[zone]")
-
-        conn.send({"command": "GUILD_TRANSFER_LEADER", "payload": {"target": "Nobody"}})
-        conn.recv_until("GUILD_REJECTED", prefix="[zone]")
-
-        conn.send({"command": "GUILD_KICK", "payload": {"target": "Nobody"}})
-        conn.recv_until("GUILD_REJECTED", prefix="[zone]")
-
-        conn.send({"command": "GUILD_PROMOTE", "payload": {"target": "Nobody"}})
-        conn.recv_until("GUILD_REJECTED", prefix="[zone]")
-
-        conn.send({"command": "GUILD_DEMOTE", "payload": {"target": "Nobody"}})
-        conn.recv_until("GUILD_REJECTED", prefix="[zone]")
-
-        conn.send({"command": "CHAT_GUILD", "payload": {"message": "guild hello"}})
-        conn.recv_until("CHAT_MESSAGE", prefix="[zone]")
-
-        conn.send({"command": "GUILD_DISBAND"})
-        conn.recv_until("GUILD_UPDATE", prefix="[zone]")
-
-        conn.send({"command": "SKILL_TREE"})
-        conn.recv_until("SKILL_TREE", prefix="[zone]")
-
-        conn.send({"command": "GET_RECIPES"})
-        recipes_msg = conn.recv_until("RECIPES", prefix="[zone]")
-        recipes_payload = recipes_msg.get("payload", {})
-        recipe_list = recipes_payload.get("recipes", [])
-        recipe_ids = {entry.get("id") for entry in recipe_list if isinstance(entry, dict)}
-        if "guardian_shield" not in recipe_ids:
-            raise RuntimeError(f"expected guardian_shield recipe in GET_RECIPES, got {recipe_ids!r}")
-        if "hunter_helm" not in recipe_ids:
-            raise RuntimeError(f"expected hunter_helm recipe in GET_RECIPES, got {recipe_ids!r}")
-        if "sigil_ring" not in recipe_ids:
-            raise RuntimeError(f"expected sigil_ring recipe in GET_RECIPES, got {recipe_ids!r}")
-
-        conn.send({"command": "CRAFT_ITEM", "payload": {"recipe_id": "unknown_recipe", "qty": 1}})
-        conn.recv_until("CRAFT_REJECTED", prefix="[zone]")
-        conn.send({"command": "CRAFT_ITEM", "payload": {"recipe_id": "wolfhide_bow", "qty": 21}})
-        craft_rejected = conn.recv_until("CRAFT_REJECTED", prefix="[zone]")
-        if craft_rejected.get("payload") != "INVALID_QTY":
-            raise RuntimeError(f"expected INVALID_QTY craft rejection, got {craft_rejected!r}")
-
-        conn.send({"command": "LEARN_SKILL", "payload": {"skill_id": "burst_arrow"}})
-        conn.recv_until_any(["SKILL_LEARNED", "SKILL_REJECTED"], prefix="[zone]")
+        current_pos = (0.0, 0.0, 0.0)
+        current_pos = move_to(conn, current_pos, (86.0, 0.0, 86.0), "[zone]")
 
         conn.send({"command": "LIST_ENTITIES"})
-        conn.recv_until("ENTITIES", prefix="[zone]")
-
-        conn.send({"command": "TALK_NPC", "payload": {"npc": "Elder Rowan", "choice": "honor"}})
-        conn.recv_until("NPC_STATE", prefix="[zone]")
-
-        conn.send({"command": "SUMMON_PET", "payload": {"pet": "Falcon"}})
-        summon_before_unlock = conn.recv_until_any(["PET_SUMMONED", "PET_REJECTED"], prefix="[zone]")
-        if summon_before_unlock.get("command") != "PET_REJECTED" or summon_before_unlock.get("payload") != "PET_NOT_ACQUIRED":
-            raise RuntimeError(f"expected PET_REJECTED/PET_NOT_ACQUIRED before quest unlock, got {summon_before_unlock!r}")
-
-        conn.send({"command": "ACCEPT_QUEST", "payload": {"quest_id": "unlock_world2_race"}})
-        conn.recv_until("QUEST_ACCEPTED", prefix="[zone]")
-
-        conn.send({"command": "COMPLETE_QUEST", "payload": {"quest_id": "unlock_world2_race"}})
-        conn.recv_until("QUEST_COMPLETED", prefix="[zone]")
-
-        conn.send({"command": "PET_FEED", "payload": {"qty": 1}})
-        pet_feed_after_unlock = conn.recv_until_any(["PET_UPDATE", "PET_REJECTED"], prefix="[zone]")
-        if pet_feed_after_unlock.get("command") == "PET_REJECTED" and pet_feed_after_unlock.get("payload") == "PET_NOT_ACQUIRED":
-            raise RuntimeError(f"unexpected PET_NOT_ACQUIRED after unlock quest, got {pet_feed_after_unlock!r}")
-
-        conn.send({"command": "ENTER_WORLD", "payload": {"world_id": 2}})
-        conn.recv_until("ENTER_DENIED", prefix="[zone]")
-
-        conn.send({"command": "SUMMON_PET", "payload": {"pet": "Falcon"}})
-        conn.recv_until("PET_SUMMONED", prefix="[zone]")
-
-        conn.send({"command": "RECRUIT_MERC", "payload": {"class": "Warrior"}})
-        conn.recv_until("MERC_RECRUITED", prefix="[zone]")
-
-        conn.send({"command": "MERC_EQUIP_ITEM", "payload": {"item_id": "unknown_item"}})
-        conn.recv_until("MERC_REJECTED", prefix="[zone]")
-
-        conn.send({"command": "MERC_EQUIP_ITEM", "payload": {"item_id": "starter_bow"}})
-        conn.recv_until_any(["MERC_UPDATE", "MERC_REJECTED"], prefix="[zone]")
-
-        conn.send({"command": "EQUIP_ITEM", "payload": {"item_id": "starter_bow"}})
-        equip_rejected = conn.recv_until_any(["EQUIP_REJECTED", "EQUIP_OK"], prefix="[zone]")
-        if equip_rejected.get("command") != "EQUIP_REJECTED":
-            raise RuntimeError(f"expected EQUIP_REJECTED when merc has starter_bow, got {equip_rejected!r}")
-
-        conn.send({"command": "MERC_UNEQUIP_ITEM", "payload": {"slot": "weapon"}})
-        conn.recv_until_any(["MERC_UPDATE", "MERC_REJECTED"], prefix="[zone]")
-
-        conn.send({"command": "EQUIP_ITEM", "payload": {"item_id": "starter_bow"}})
-        conn.recv_until("EQUIP_OK", prefix="[zone]")
-
-        conn.send({"command": "SET_ELEMENT", "payload": {"target": "weapon", "element": "Fire"}})
-        conn.recv_until("ELEMENT_SET", prefix="[zone]")
-
-        defeated = False
-        material_drops = {}
-        for _ in range(6):
-            conn.send({"command": "ATTACK_MOB", "payload": {"mob_id": "mob_wolf_01", "skill_id": "burst_arrow"}})
-            mob_result = conn.recv_until("MOB_ATTACK_RESULT", prefix="[zone]")
-            payload = mob_result.get("payload", {})
-            if payload.get("defeated"):
-                drops = payload.get("drops", [])
-                if not isinstance(drops, list) or not drops:
-                    raise RuntimeError(f"expected non-empty drops list on defeat, got {drops!r}")
-                for drop in drops:
-                    if not isinstance(drop, dict):
-                        raise RuntimeError(f"invalid drop entry type: {drop!r}")
-                    kind = drop.get("kind")
-                    item_id = drop.get("item_id")
-                    qty = as_int(drop.get("qty"))
-                    if kind not in ("material", "gear"):
-                        raise RuntimeError(f"invalid drop kind: {drop!r}")
-                    if not isinstance(item_id, str) or not item_id:
-                        raise RuntimeError(f"missing drop item_id: {drop!r}")
-                    if qty < 1:
-                        raise RuntimeError(f"invalid drop qty: {drop!r}")
-                    if kind == "gear" and "item" not in drop:
-                        raise RuntimeError(f"gear drop missing item payload: {drop!r}")
-                    if kind == "material":
-                        material_drops[item_id] = material_drops.get(item_id, 0) + qty
-                defeated = True
-                break
-            if payload.get("status") == "PLAYER_DIED":
-                conn.send({"command": "RECOVER_CORPSE"})
-                conn.recv_until("CORPSE_RECOVERY", prefix="[zone]")
-        if not defeated:
-            raise RuntimeError("failed to defeat mob_wolf_01 in smoke test")
-        if not material_drops:
-            raise RuntimeError("expected at least one material drop on mob defeat")
+        entities_msg = conn.recv_until("ENTITIES", prefix="[zone]")
+        entities_payload = entities_msg.get("payload", {})
+        if find_visible_mob(entities_payload, "mob_wolf_01") is None:
+            raise RuntimeError(f"expected mob_wolf_01 to be visible near farming position, got {entities_payload!r}")
 
         conn.send({"command": "GET_STATE"})
-        state_msg = conn.recv_until("STATE", prefix="[zone]")
-        state_after_loot = as_materials_map(state_msg.get("payload", {}))
-        for item_id, drop_qty in material_drops.items():
-            before_qty = state_before_loot.get(item_id, 0)
-            after_qty = state_after_loot.get(item_id, 0)
-            if after_qty-before_qty != drop_qty:
+        before_fight = conn.recv_until("STATE", prefix="[zone]")
+        materials_before = as_materials_map(before_fight.get("payload", {}))
+
+        result = defeat_mob(conn, "mob_wolf_01", "arc_bolt", "[zone]")
+        if not result.get("defeated"):
+            raise RuntimeError(f"expected defeated mob payload, got {result!r}")
+
+        material_drops = {}
+        for drop in result.get("drops", []):
+            if not isinstance(drop, dict):
+                continue
+            if drop.get("kind") == "material":
+                item_id = drop.get("item_id")
+                qty = as_int(drop.get("qty"))
+                if item_id and qty > 0:
+                    material_drops[item_id] = material_drops.get(item_id, 0) + qty
+        if not material_drops:
+            raise RuntimeError(f"expected at least one material drop, got {result!r}")
+
+        conn.send({"command": "GET_STATE"})
+        after_fight = conn.recv_until("STATE", prefix="[zone]")
+        materials_after = as_materials_map(after_fight.get("payload", {}))
+        for item_id, qty in material_drops.items():
+            delta = materials_after.get(item_id, 0) - materials_before.get(item_id, 0)
+            if delta != qty:
                 raise RuntimeError(
-                    f"material delta mismatch for {item_id}: before={before_qty} after={after_qty} expected_delta={drop_qty}"
+                    f"material persistence mismatch for {item_id}: before={materials_before.get(item_id, 0)} after={materials_after.get(item_id, 0)} expected_delta={qty}"
                 )
 
-        # Ensure we have at least one T1 enhance gem so UPGRADE_GEAR happy-path is exercised.
-        gem_t1_qty = state_after_loot.get("enhance_gem_t1", 0)
-        farm_attempts = 0
-        farm_mobs = ("mob_wolf_01", "mob_bandit_01")
-        while gem_t1_qty < 1 and farm_attempts < 80:
-            mob_id = farm_mobs[farm_attempts % len(farm_mobs)]
-            farm_attempts += 1
-            defeated_target = False
-            for _ in range(6):
-                conn.send({"command": "ATTACK_MOB", "payload": {"mob_id": mob_id, "skill_id": "burst_arrow"}})
-                attack_result = conn.recv_until_any(["MOB_ATTACK_RESULT", "MOB_ATTACK_REJECTED"], prefix="[zone]")
-                if attack_result.get("command") == "MOB_ATTACK_REJECTED":
-                    # Mob is likely on respawn; switch target attempt instead of spamming rejects.
-                    time.sleep(0.35)
-                    break
-                attack_payload = attack_result.get("payload", {})
-                if attack_payload.get("defeated"):
-                    for drop in attack_payload.get("drops", []):
-                        if (
-                            isinstance(drop, dict)
-                            and drop.get("kind") == "material"
-                            and drop.get("item_id") == "enhance_gem_t1"
-                        ):
-                            gem_t1_qty += as_int(drop.get("qty"))
-                    defeated_target = True
-                    break
-                if attack_payload.get("status") == "PLAYER_DIED":
-                    conn.send({"command": "RECOVER_CORPSE"})
-                    conn.recv_until("CORPSE_RECOVERY", prefix="[zone]")
-            if not defeated_target:
-                time.sleep(0.25)
+        move_to(conn, current_pos, (-10.0, 0.0, 5.0), "[zone]")
 
-        conn.send({"command": "GET_STATE"})
-        state_msg = conn.recv_until("STATE", prefix="[zone]")
-        state_before_upgrade = as_materials_map(state_msg.get("payload", {}))
-        if state_before_upgrade.get("enhance_gem_t1", 0) < 1:
-            raise RuntimeError(f"expected at least one enhance_gem_t1 before upgrade, got {state_before_upgrade!r}")
-
-        conn.send({"command": "UPGRADE_GEAR", "payload": {"item_id": "starter_bow"}})
-        upgrade_msg = conn.recv_until_any(["GEAR_UPGRADE_RESULT", "GEAR_UPGRADE_REJECTED"], prefix="[zone]")
-        if upgrade_msg.get("command") != "GEAR_UPGRADE_RESULT":
-            raise RuntimeError(f"expected GEAR_UPGRADE_RESULT for starter_bow upgrade, got {upgrade_msg!r}")
-        upgrade_payload = upgrade_msg.get("payload", {})
-        for key in ("old_gear_level", "new_gear_level", "success", "gem", "cost", "failure_effect"):
-            if key not in upgrade_payload:
-                raise RuntimeError(f"missing {key!r} in GEAR_UPGRADE_RESULT payload: {upgrade_payload!r}")
-        if as_int(upgrade_payload.get("old_gear_level")) != 1:
-            raise RuntimeError(f"expected old_gear_level=1 for starter_bow first upgrade, got {upgrade_payload!r}")
-        if upgrade_payload.get("gem") != "enhance_gem_t1" or as_int(upgrade_payload.get("cost")) != 1:
-            raise RuntimeError(f"unexpected upgrade gem/cost payload: {upgrade_payload!r}")
-        if upgrade_payload.get("failure_effect") != "NONE":
-            raise RuntimeError(f"expected failure_effect=NONE for +1 upgrade tier, got {upgrade_payload!r}")
-        success = bool(upgrade_payload.get("success"))
-        expected_new_level = 2 if success else 1
-        if as_int(upgrade_payload.get("new_gear_level")) != expected_new_level:
-            raise RuntimeError(
-                f"unexpected new_gear_level for success={success}: payload={upgrade_payload!r}"
-            )
-
-        conn.send({"command": "GET_STATE"})
-        state_msg = conn.recv_until("STATE", prefix="[zone]")
-        state_after_upgrade = as_materials_map(state_msg.get("payload", {}))
-        if state_before_upgrade.get("enhance_gem_t1", 0)-state_after_upgrade.get("enhance_gem_t1", 0) != 1:
-            raise RuntimeError(
-                "upgrade gem consumption mismatch for enhance_gem_t1: "
-                f"before={state_before_upgrade.get('enhance_gem_t1', 0)} "
-                f"after={state_after_upgrade.get('enhance_gem_t1', 0)}"
-            )
-        state_before_craft = dict(state_after_upgrade)
-
-        conn.send({"command": "CRAFT_ITEM", "payload": {"recipe_id": "wolfhide_bow", "qty": 1}})
-        craft_msg = conn.recv_until("CRAFT_OK", prefix="[zone]")
-        craft_payload = craft_msg.get("payload", {})
-        consumed = craft_payload.get("consumed", {})
-        if not isinstance(consumed, dict) or as_int(consumed.get("wolf_pelt")) < 1:
-            raise RuntimeError(f"expected wolf_pelt consumption in craft payload, got {craft_payload!r}")
-
-        conn.send({"command": "GET_STATE"})
-        state_msg = conn.recv_until("STATE", prefix="[zone]")
-        state_after_craft = as_materials_map(state_msg.get("payload", {}))
-        consumed_wolf = as_int(consumed.get("wolf_pelt"))
-        if state_before_craft.get("wolf_pelt", 0)-state_after_craft.get("wolf_pelt", 0) != consumed_wolf:
-            raise RuntimeError(
-                "craft material delta mismatch for wolf_pelt: "
-                f"before_craft={state_before_craft.get('wolf_pelt', 0)} "
-                f"after_craft={state_after_craft.get('wolf_pelt', 0)} "
-                f"consumed={consumed_wolf}"
-            )
-
-        # Upgrade + craft can validly consume the only tracked materials; farm one more drop if needed.
-        if not any(qty > 0 for qty in state_after_craft.values()):
-            refill_mobs = ("mob_wolf_01", "mob_bandit_01")
-            for mob_id in refill_mobs:
-                for _ in range(10):
-                    conn.send({"command": "ATTACK_MOB", "payload": {"mob_id": mob_id, "skill_id": "burst_arrow"}})
-                    refill_result = conn.recv_until_any(["MOB_ATTACK_RESULT", "MOB_ATTACK_REJECTED"], prefix="[zone]")
-                    if refill_result.get("command") == "MOB_ATTACK_REJECTED":
-                        time.sleep(0.35)
-                        continue
-                    refill_payload = refill_result.get("payload", {})
-                    if refill_payload.get("status") == "PLAYER_DIED":
-                        conn.send({"command": "RECOVER_CORPSE"})
-                        conn.recv_until("CORPSE_RECOVERY", prefix="[zone]")
-                    if refill_payload.get("defeated"):
-                        conn.send({"command": "GET_STATE"})
-                        refill_state_msg = conn.recv_until("STATE", prefix="[zone]")
-                        state_after_craft = as_materials_map(refill_state_msg.get("payload", {}))
-                        if any(qty > 0 for qty in state_after_craft.values()):
-                            break
-                if any(qty > 0 for qty in state_after_craft.values()):
-                    break
-
-        deposit_material_id = None
-        for candidate in ("wolf_pelt", "bandit_scrap", "pet_treat", "enhance_gem_t1"):
-            if state_after_craft.get(candidate, 0) > 0:
-                deposit_material_id = candidate
-                break
-        if not deposit_material_id:
-            for item_id, qty in state_after_craft.items():
-                if qty > 0:
-                    deposit_material_id = item_id
-                    break
-        if not deposit_material_id:
-            raise RuntimeError(f"expected at least one material to validate storage deposit, got {state_after_craft!r}")
-
-        conn.send({"command": "STORAGE_DEPOSIT_MATERIAL", "payload": {"item_id": deposit_material_id, "qty": 1}})
-        storage_state = conn.recv_until("STORAGE_STATE", prefix="[zone]")
-        storage_payload = storage_state.get("payload", {})
+        deposit_item_id = next(iter(material_drops.keys()))
+        conn.send({"command": "STORAGE_DEPOSIT_MATERIAL", "payload": {"item_id": deposit_item_id, "qty": 1}})
+        storage_deposit = conn.recv_until("STORAGE_STATE", prefix="[zone]")
+        storage_payload = storage_deposit.get("payload", {})
         storage_materials = storage_payload.get("storage", {}).get("materials", {})
-        if as_int(storage_materials.get(deposit_material_id)) < 1:
-            raise RuntimeError(
-                f"expected {deposit_material_id} in storage after deposit, got {storage_payload!r}"
-            )
+        if as_int(storage_materials.get(deposit_item_id)) < 1:
+            raise RuntimeError(f"expected {deposit_item_id} in storage after deposit, got {storage_payload!r}")
 
-        conn.send({"command": "STORAGE_WITHDRAW_MATERIAL", "payload": {"item_id": deposit_material_id, "qty": 1}})
+        conn.send({"command": "STORAGE_WITHDRAW_MATERIAL", "payload": {"item_id": deposit_item_id, "qty": 1}})
         conn.recv_until("STORAGE_STATE", prefix="[zone]")
-
-        conn.send({"command": "ATTACK_PVP", "payload": {"target": "Lowbie", "skill_id": "burst_arrow"}})
-        conn.recv_until("PVP_REJECTED", prefix="[zone]")
-
-        conn.send({"command": "ATTACK", "payload": {"target": "rift_wolf", "target_level": 44}})
-        conn.recv_until("COMBAT_RESULT", prefix="[zone]")
-
-        conn.send({"command": "MOVE", "payload": {"x": 105.0, "y": 0.0, "z": 105.0}})
-        conn.recv_until("MOVE_OK", prefix="[zone]")
-
-        for x in (112.0, 119.0, 126.0, 133.0, 140.0, 147.0):
-            conn.send({"command": "MOVE", "payload": {"x": x, "y": 0.0, "z": x}})
-            conn.recv_until("MOVE_OK", prefix="[zone]")
-        conn.send({"command": "STORAGE_VIEW"})
-        storage_far = conn.recv_until_any(["STORAGE_STATE", "STORAGE_REJECTED"], prefix="[zone]")
-        if storage_far.get("command") != "STORAGE_REJECTED" or storage_far.get("payload") != "STORAGE_NPC_REQUIRED":
-            raise RuntimeError(f"expected STORAGE_REJECTED/STORAGE_NPC_REQUIRED far from storage NPC, got {storage_far!r}")
-
-        conn.send({"command": "MOVE", "payload": {"x": 500.0, "y": 0.0, "z": 500.0}})
-        conn.recv_until("MOVE_REJECTED", prefix="[zone]")
     finally:
         conn.close()
 
+    _, reauth_state = auth_and_get_state(token, "Archer", "[reauth]")
+    reauth_materials = as_materials_map(reauth_state)
+    for item_id, qty in material_drops.items():
+        if reauth_materials.get(item_id, 0) < materials_before.get(item_id, 0) + qty:
+            raise RuntimeError(
+                f"expected persisted material {item_id} after reconnect, got {reauth_materials!r}"
+            )
+    if reauth_state.get("class") != "Mage":
+        raise RuntimeError(f"expected sticky class Mage after reconnect, got {reauth_state!r}")
+
 
 if __name__ == "__main__":
+    assert_health_endpoints()
+
     class_username = f"SmokeClass_{int(time.time())}"
-    class_token = login_and_get_token(class_username, "demo")
+    class_token = login_and_get_token(class_username, "demo-pass")
     test_class_bootstrap_and_sticky(class_token)
 
     username = f"SmokeHero_{int(time.time())}"
-    token = login_and_get_token(username, "demo")
-    test_zone(token, username)
+    token = login_and_get_token(username, "demo-pass")
+    test_zone(token)
+    print("smoke test passed")

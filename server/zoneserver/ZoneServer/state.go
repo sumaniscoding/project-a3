@@ -38,5 +38,6 @@ func statePayload(s *ClientSession) map[string]interface{} {
 		"guild":        c.Guild,
 		"guild_role":   c.GuildRole,
 		"party":        partySnapshotForCharacter(c.Name),
+		"weapon":       getWeaponType(c),
 	}
 }

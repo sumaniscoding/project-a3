@@ -1,12 +1,11 @@
 package main
 
 import (
-	"net"
 	"time"
 )
 
 type ClientSession struct {
-	Conn          net.Conn
+	Conn          WSConn
 	Character     *Character
 	Account       *Account
 	World         *World
@@ -18,7 +17,7 @@ type ClientSession struct {
 	WindowCount   int
 }
 
-func NewSession(conn net.Conn) *ClientSession {
+func NewSession(conn WSConn) *ClientSession {
 	return &ClientSession{
 		Conn:          conn,
 		Active:        true,
